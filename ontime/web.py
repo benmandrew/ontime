@@ -38,6 +38,7 @@ state = State()
 
 
 def refresh_timetable(conn) -> None:
+    """Reload the day's trips when the service date rolls over."""
     today = datetime.now(LONDON).date()
     if state.trips_for == today:
         return
@@ -45,12 +46,21 @@ def refresh_timetable(conn) -> None:
     state.trips = load_trips(conn, days)
     state.trips_for = today
     state.routes = {t.route_name for t in state.trips}
-    state.segments = history.load_segment_stats(conn)
     print(
-        f"[timetable] {len(state.trips)} trips for {today}, "
-        f"routes {sorted(state.routes)}, "
-        f"{len(state.segments)} learned segments"
+        f"[timetable] {len(state.trips)} trips for {today}, routes {sorted(state.routes)}"
     )
+
+
+def refresh_segments(conn) -> None:
+    """Reload learned segment times on every poll.
+
+    These are rewritten by the maintenance container roughly hourly, and this
+    process has no way of being told. Tying the reload to the timetable date
+    instead would leave the dashboard using yesterday's model all day. The
+    query returns a few thousand rows at most, so re-reading it every cycle
+    costs less than tracking staleness would.
+    """
+    state.segments = history.load_segment_stats(conn)
 
 
 def build_board(conn) -> dict:
@@ -125,24 +135,47 @@ def build_board(conn) -> dict:
     }
 
 
-async def poller() -> None:
+def poll_once() -> dict:
+    """One full cycle, run entirely on a worker thread.
+
+    The connection is opened here rather than held across polls because
+    sqlite3 refuses to share a connection between threads, and
+    `asyncio.to_thread` does not guarantee the same worker each time.
+    Connecting is cheap next to fetching and parsing the feed.
+    """
     conn = db.connect()
-    db.init(conn)
+    try:
+        db.init(conn)
+        refresh_timetable(conn)
+        refresh_segments(conn)
+        return build_board(conn)
+    finally:
+        conn.close()
+
+
+async def poll_and_store() -> None:
+    """Refresh `state.board`, surfacing failures rather than raising."""
+    try:
+        state.board = await asyncio.to_thread(poll_once)
+        c = state.board["counts"]
+        print(f"[poll] feed={c['feed']} matched={c['matched']}")
+    except Exception as exc:  # a bad poll must not stop the loop
+        msg = config.redact(str(exc))
+        print(f"[poll] error: {msg}")
+        state.board = {**state.board, "error": msg}
+
+
+async def poller() -> None:
     while True:
-        try:
-            refresh_timetable(conn)
-            state.board = await asyncio.to_thread(build_board, conn)
-            c = state.board["counts"]
-            print(f"[poll] feed={c['feed']} matched={c['matched']}")
-        except Exception as exc:  # keep the loop alive
-            msg = config.redact(str(exc))
-            print(f"[poll] error: {msg}")
-            state.board = {**state.board, "error": msg}
         await asyncio.sleep(config.POLL_SECS)
+        await poll_and_store()
 
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Warm the board before accepting traffic, so the first request is not
+    # answered with an empty page and /healthz means something immediately.
+    await poll_and_store()
     task = asyncio.create_task(poller())
     yield
     task.cancel()

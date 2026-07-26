@@ -7,6 +7,7 @@ never stalls the departure board.
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import traceback
 from datetime import UTC, datetime, timedelta
@@ -14,7 +15,10 @@ from datetime import UTC, datetime, timedelta
 from . import config, db, history, ingest
 from .matching import LONDON, load_trips
 
-INGEST_INTERVAL = 24 * 3600
+# How often the loop wakes to check whether anything is due.
+TICK_SECS = 60
+# Segments are relearned this often; the timetable is rebuilt once per day,
+# decided by the persisted build date rather than by elapsed time.
 LEARN_INTERVAL = 3600
 
 
@@ -41,21 +45,40 @@ def run_learn() -> None:
     conn.close()
 
 
-def main() -> None:
-    last_ingest = 0.0
-    last_learn = 0.0
-    while True:
-        now = time.monotonic()
+def cache_is_current() -> bool:
+    """Whether the timetable cache was built for today's service date.
+
+    Process uptime is the wrong thing to measure here. A container that
+    restarts every few hours would keep resetting a monotonic timer and could
+    go indefinitely without refreshing, so the check reads the build date
+    persisted in the database instead.
+    """
+    if not config.DB_PATH.exists():
+        return False
+    try:
+        conn = db.connect(readonly=True)
         try:
-            if now - last_ingest >= INGEST_INTERVAL or not config.DB_PATH.exists():
+            row = conn.execute("SELECT value FROM meta WHERE key='built_at'").fetchone()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return bool(row) and row["value"] == datetime.now(LONDON).date().isoformat()
+
+
+def main() -> None:
+    last_learn: float | None = None
+    while True:
+        try:
+            if not cache_is_current():
                 run_ingest()
-                last_ingest = now
-            if now - last_learn >= LEARN_INTERVAL:
+            now = time.monotonic()
+            if last_learn is None or now - last_learn >= LEARN_INTERVAL:
                 run_learn()
                 last_learn = now
         except Exception:
             print("[maint] error:\n" + config.redact(traceback.format_exc()))
-        time.sleep(60)
+        time.sleep(TICK_SECS)
 
 
 if __name__ == "__main__":
