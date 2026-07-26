@@ -26,3 +26,10 @@ venv/
 
 # macOS
 .DS_Store
+
+# Coverage / tooling caches
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
