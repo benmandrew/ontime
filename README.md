@@ -47,6 +47,8 @@ python -m ontime.web      # http://127.0.0.1:8000
 
 Registration for a free key takes a minute at [data.bus-data.dft.gov.uk](https://data.bus-data.dft.gov.uk/account/signup/).
 
+The flake disables the check phase on `fastapi`. Nixpkgs has no binary cache coverage for it on `aarch64-darwin`, so it builds from source, and running its upstream test suite pulls in `scipy`, `pint` and `uncertainties`. Compiling scipy on Apple silicon turned a 12-second shell into the better part of an hour, all to re-verify a release upstream had already tested. Skipping it drops the build list from 12 derivations to 3.
+
 ### Docker, behind Tailscale
 
 The compose file runs two services over one named volume. The dashboard polls and predicts; the maintenance loop refreshes the 89MB timetable archive daily and relearns segments hourly, so a download never stalls the departure board.
@@ -63,6 +65,26 @@ tailscale serve status
 ```
 
 That gives an HTTPS URL on the tailnet with a certificate issued automatically, reachable only by devices signed into the same account. To withdraw it, `tailscale serve --https=443 off`. Avoid `tailscale funnel` here: it publishes to the open internet, and this application has no authentication of its own.
+
+## Resource usage
+
+Measured on Apple silicon against the real feed and the full North West archive, with `python scripts/benchmark.py`:
+
+| | |
+|---|---|
+| Timetable ingest | 17 s, from an 89MB archive with a 398MB `stop_times.txt` |
+| Cache on disk | 8.9 MB for 1,135 trips and 54,131 stop times |
+| Vehicle-to-trip matching | 1.41 ms per vehicle, 19 of 20 matched |
+| Whole poll cycle at 40 vehicles | about 300 ms, of which 240 ms is waiting on the network |
+| Duty cycle at a 15-second poll | under 3% |
+| Resident memory | 60 MB |
+| Position history | roughly 8 MB a day, 165 MB at the 21-day retention |
+
+Matching is cheap because the first tier — origin stop, destination stop and aimed departure time — almost always hits, so the geometric fallback that walks every candidate path rarely runs.
+
+Indices are deliberately sparse. Each was checked with `EXPLAIN QUERY PLAN` against a real cache, and four that no query reached were removed: one unused index on `observations` alone cost 45% more insert time, 430 ms against 297 ms per 200,000 rows, and inserting is the hot path. The remaining full-table scans are intentional, either because the caller wants every row or because the table holds a few hundred of them.
+
+Reducing raw positions to per-stop events scans only the last 26 hours. That step is idempotent, so older positions have already been reduced, and rescanning the full retention window hourly would mean loading hundreds of thousands of rows to rewrite results that cannot have changed.
 
 ## Configuration
 

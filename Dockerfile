@@ -1,4 +1,6 @@
-# syntax=docker/dockerfile:1
+# No `# syntax=` directive on purpose: pinning the BuildKit frontend forces a
+# registry round trip on every build and breaks offline builds entirely.
+# Nothing below needs a newer frontend than the built-in one.
 #
 # Two stages. The builder compiles a wheel and resolves dependencies; the
 # runtime layer receives the resulting virtualenv and nothing else. No
@@ -31,7 +33,13 @@ FROM python:3.12-slim AS runtime
 
 RUN adduser --system --group --home /app ontime \
  && mkdir -p /data \
- && chown ontime:ontime /data
+ && chown ontime:ontime /data \
+ # The base image ships its own pip outside the virtualenv, so stripping the
+ # venv's copy in the builder is not enough. A package installer in a running
+ # production container is a way to turn code execution into arbitrary
+ # dependency installation; nothing here needs one.
+ && rm -rf /usr/local/bin/pip* /usr/local/lib/python*/site-packages/pip \
+           /usr/local/lib/python*/site-packages/pip-*.dist-info
 
 COPY --from=builder --chown=root:root /opt/venv /opt/venv
 

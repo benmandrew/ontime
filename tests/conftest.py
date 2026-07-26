@@ -30,6 +30,11 @@ STOP_50 = "1800SB13961"  # MANGPWTD, Swinton Grove
 # Watched but absent from the cut-down archive.
 STOP_ABSENT = "1800EB01881"  # MANADGMT, Hyde Grove
 
+# Production reduces only the last 26 hours of positions, because older runs
+# have already been reduced. Tests seed history days back on purpose, so they
+# ask for a window wide enough to cover it.
+WIDE_LOOKBACK_HOURS = 24 * 40
+
 
 @pytest.fixture
 def data_dir(tmp_path, monkeypatch):

@@ -22,6 +22,7 @@ from .conftest import (
     STOP_50,
     STOP_192,
     STOP_ABSENT,
+    WIDE_LOOKBACK_HOURS,
     any_trip_serving,
     load_trip,
     siri_document,
@@ -162,7 +163,9 @@ class TestLearningImprovesPredictions:
                 when = anchor + timedelta(seconds=(i - pivot_index) * self.SLOW_PACE_SECS)
                 history.record(conn, FakeVehicle(f"H{run}", when, lat, lon), trip.trip_id)
         conn.commit()
-        history.derive_stop_events(conn, {trip.trip_id: trip})
+        history.derive_stop_events(
+            conn, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
         assert history.learn_segments(conn) > 0
         assert history.load_segment_stats(conn), "segments must clear MIN_SAMPLES"
 

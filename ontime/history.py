@@ -28,6 +28,10 @@ STOP_RADIUS_M = 120.0
 # Segments need at least this many observations before the learned time is used.
 MIN_SAMPLES = 5
 
+# How far back `derive_stop_events` scans raw positions. Wider than the hourly
+# cadence it runs at, so a skipped pass loses nothing.
+LOOKBACK_HOURS = 26
+
 
 def record(conn: sqlite3.Connection, vehicle, trip_id: str | None) -> None:
     conn.execute(
@@ -53,20 +57,32 @@ def trim(conn: sqlite3.Connection, retain_days: int) -> int:
     return cur.rowcount
 
 
-def derive_stop_events(conn: sqlite3.Connection, trips: dict[str, Trip]) -> int:
+def derive_stop_events(
+    conn: sqlite3.Connection, trips: dict[str, Trip], lookback_hours: int = LOOKBACK_HOURS
+) -> int:
     """Reduce raw positions to one closest-approach event per stop per run.
 
     Only runs that have gone quiet for an hour are processed, so a trip still
     in progress is not frozen halfway.
+
+    The scan is bounded to `lookback_hours`. Reducing a run is idempotent —
+    the write is an upsert keyed on (service_date, trip, vehicle, seq) — so
+    anything older has already been reduced by an earlier pass, and rescanning
+    the whole retention window each hour would mean loading hundreds of
+    thousands of rows to rewrite results that cannot have changed. The window
+    is comfortably wider than the hourly cadence, so a few missed runs still
+    get picked up on the next pass.
     """
-    quiet_before = int((datetime.now(UTC) - timedelta(hours=1)).timestamp())
+    now = datetime.now(UTC)
+    quiet_before = int((now - timedelta(hours=1)).timestamp())
+    since = int((now - timedelta(hours=lookback_hours)).timestamp())
     groups: dict[tuple[str, str], list[tuple[int, float, float]]] = defaultdict(list)
 
     q = (
         "SELECT trip_id, vehicle_ref, recorded_at, lat, lon FROM observations "
-        "WHERE trip_id IS NOT NULL ORDER BY recorded_at"
+        "WHERE trip_id IS NOT NULL AND recorded_at >= ? ORDER BY recorded_at"
     )
-    for r in conn.execute(q):
+    for r in conn.execute(q, (since,)):
         groups[(r["trip_id"], r["vehicle_ref"])].append(
             (r["recorded_at"], r["lat"], r["lon"])
         )

@@ -1,4 +1,13 @@
-"""SQLite schema and connection handling for the cached timetable."""
+"""SQLite schema and connection handling for the cached timetable.
+
+Indices here are deliberately sparse. Every one was checked with EXPLAIN QUERY
+PLAN against a real cache, and the ones no query reached were removed: an
+unused index on `observations` alone cost 45% more insert time (297ms against
+430ms for 200,000 rows), and inserting is the hot path — every vehicle, every
+poll, all day. The remaining full-table scans are intentional, either because
+the caller genuinely wants every row or because the table has a few hundred
+rows in it. Re-run `scripts/benchmark.py` before adding another.
+"""
 
 from __future__ import annotations
 
@@ -26,7 +35,6 @@ CREATE TABLE IF NOT EXISTS trips (
     first_dep      INTEGER,   -- seconds since service-day midnight
     last_arr       INTEGER
 );
-CREATE INDEX IF NOT EXISTS trips_route_dep ON trips (route_name, first_dep);
 
 -- Full stop sequence for every trip that calls at a watched stop.
 CREATE TABLE IF NOT EXISTS trip_stops (
@@ -37,7 +45,6 @@ CREATE TABLE IF NOT EXISTS trip_stops (
     dep     INTEGER,
     PRIMARY KEY (trip_id, seq)
 );
-CREATE INDEX IF NOT EXISTS trip_stops_stop ON trip_stops (stop_id);
 
 -- The subset of calls that happen at a watched stop.
 CREATE TABLE IF NOT EXISTS target_calls (
@@ -82,7 +89,8 @@ CREATE TABLE IF NOT EXISTS observations (
     trip_id     TEXT,               -- NULL when unmatched
     PRIMARY KEY (vehicle_ref, recorded_at)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS obs_trip ON observations (trip_id, recorded_at);
+-- Earns its keep: serves the bounded scan in derive_stop_events, the retention
+-- DELETE in trim, and MIN/MAX in stats_summary as a covering index.
 CREATE INDEX IF NOT EXISTS obs_time ON observations (recorded_at);
 
 -- Actual time a matched vehicle was observed closest to a stop on its trip.
@@ -95,9 +103,10 @@ CREATE TABLE IF NOT EXISTS stop_events (
     actual_at    INTEGER NOT NULL,  -- unix seconds
     sched_arr    INTEGER,           -- seconds since service-day midnight
     dist_m       REAL,              -- closest approach, a confidence proxy
+    -- This key order is also learn_segments' required sort order, so the
+    -- aggregate reads straight down the primary index with no separate sort.
     PRIMARY KEY (service_date, trip_id, vehicle_ref, seq)
 );
-CREATE INDEX IF NOT EXISTS stop_events_stop ON stop_events (stop_id, actual_at);
 
 -- Learned median traversal time between consecutive stops, by context.
 CREATE TABLE IF NOT EXISTS segment_stats (

@@ -16,15 +16,16 @@
 - [x] Multi-stage Dockerfile and compose, sized for `tailscale serve`
 - [x] README, project memory
 
+- [x] Unit and end-to-end tests: 102 passing, 91% coverage
+- [x] `ruff format`, `ruff check`, `mypy ontime` clean, in the venv and under nix
+- [x] `nix develop` verified: 12s after cutting the scipy build out of the closure
+- [x] Docker image verified: 220MB, non-root, no pip or dev tooling
+- [x] Container run against the live feed with a real key
+- [x] Profiled with `scripts/benchmark.py`; removed four dead indices
+
 ## In progress
 
-- [ ] Unit tests: siri parsing, service-day maths, matcher tiers, ETA arithmetic,
-      segment learning, redaction
-- [ ] End-to-end tests: ingest the mini GTFS fixture, replay the recorded SIRI
-      sample through the poller, assert on the rendered board and the HTTP API
-- [ ] `ruff format`, `ruff check`, `mypy ontime` clean
-- [ ] Verify `nix develop` and `nix flake check`
-- [ ] Verify the Docker image builds and contains no dev tooling
+- [ ] Nothing. Waiting on history to accumulate.
 
 ## Next
 

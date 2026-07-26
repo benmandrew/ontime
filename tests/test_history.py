@@ -9,7 +9,7 @@ import pytest
 from ontime import history
 from ontime.matching import LONDON
 
-from .conftest import STOP_192, any_trip_serving, load_trip
+from .conftest import STOP_192, WIDE_LOOKBACK_HOURS, any_trip_serving, load_trip
 
 
 @pytest.fixture
@@ -90,7 +90,9 @@ class TestDeriveStopEvents:
         start = datetime.now(UTC) - timedelta(hours=4)
         drive(built_db, trip, "V1", start, 60)
 
-        written = history.derive_stop_events(built_db, {trip.trip_id: trip})
+        written = history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
         assert written == len(trip.stops)
 
         seqs = [
@@ -102,7 +104,12 @@ class TestDeriveStopEvents:
     def test_in_progress_run_is_skipped(self, built_db, trip):
         """A trip still reporting must not be frozen halfway."""
         drive(built_db, trip, "V1", datetime.now(UTC) - timedelta(minutes=5), 30)
-        assert history.derive_stop_events(built_db, {trip.trip_id: trip}) == 0
+        assert (
+            history.derive_stop_events(
+                built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+            )
+            == 0
+        )
 
     def test_distant_positions_do_not_count_as_passing(self, built_db, trip):
         start = datetime.now(UTC) - timedelta(hours=4)
@@ -113,7 +120,12 @@ class TestDeriveStopEvents:
                 trip.trip_id,
             )
         built_db.commit()
-        assert history.derive_stop_events(built_db, {trip.trip_id: trip}) == 0
+        assert (
+            history.derive_stop_events(
+                built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+            )
+            == 0
+        )
 
 
 class TestLearnSegments:
@@ -128,7 +140,9 @@ class TestLearnSegments:
                 pace,
                 upto=6,
             )
-        history.derive_stop_events(built_db, {trip.trip_id: trip})
+        history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
         learned = history.learn_segments(built_db)
         assert learned > 0
 
@@ -149,7 +163,9 @@ class TestLearnSegments:
             trip.trip_id,
         )
         built_db.commit()
-        history.derive_stop_events(built_db, {trip.trip_id: trip})
+        history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
         history.learn_segments(built_db)
         assert built_db.execute("SELECT COUNT(*) c FROM segment_stats").fetchone()["c"] == 0
 
@@ -157,7 +173,9 @@ class TestLearnSegments:
         base = datetime.now(UTC) - timedelta(hours=6)
         for day in range(2):  # below history.MIN_SAMPLES
             drive(built_db, trip, f"V{day}", base - timedelta(days=day), 60, upto=4)
-        history.derive_stop_events(built_db, {trip.trip_id: trip})
+        history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
         history.learn_segments(built_db)
         assert history.load_segment_stats(built_db) == {}
 
@@ -165,7 +183,9 @@ class TestLearnSegments:
         base = datetime.now(UTC) - timedelta(hours=6)
         for day in range(6):
             drive(built_db, trip, f"V{day}", base - timedelta(days=day), 60, upto=5)
-        history.derive_stop_events(built_db, {trip.trip_id: trip})
+        history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
         first = history.learn_segments(built_db)
         second = history.learn_segments(built_db)
         assert first == second

@@ -31,6 +31,21 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
    always stream it out of the zip, never unpack or read it whole.
 5. **GTFS times exceed 24h** for post-midnight trips. Service-day handling lives in
    `matching.service_day_offsets`.
+6. **The flake disables `fastapi`'s check phase.** Nixpkgs has no darwin cache for it,
+   so it builds from source and its test suite pulls in scipy — an hour-plus build.
+   Skipping checks takes the build list from 12 derivations to 3, `nix develop` to 12s.
+   Do not "helpfully" re-enable it.
+7. **Indices are sparse on purpose.** Four unused ones were removed after checking
+   EXPLAIN QUERY PLAN; one on `observations` cost 45% more insert time for nothing.
+   Inserting is the hot path. Measure with `scripts/benchmark.py` before adding any.
+8. **`derive_stop_events` scans only 26 hours** and is idempotent. Do not widen it to
+   the full retention window — that reloads hundreds of thousands of rows hourly to
+   rewrite results that cannot have changed. Tests pass `WIDE_LOOKBACK_HOURS`.
+
+## Measured baselines (Apple silicon, real data)
+
+Ingest 17s · cache 8.9MB · match 1.41ms/vehicle · duty cycle <3% at a 15s poll ·
+RSS 60MB · history ~8MB/day. Docker image 220MB, non-root, no pip. 102 tests in ~2s.
 
 ## Constraints
 

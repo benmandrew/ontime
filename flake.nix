@@ -10,7 +10,27 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
-        python = pkgs.python312;
+
+        # nixpkgs has no binary cache coverage for fastapi on aarch64-darwin,
+        # so it builds from source — and building it runs its upstream test
+        # suite, which drags in scipy, pint and uncertainties. Compiling scipy
+        # on Apple silicon turns a two-minute shell into the better part of an
+        # hour, to re-verify a release upstream already tested. Disabling the
+        # check phase drops those inputs from the closure entirely.
+        skipChecks = drv:
+          drv.overridePythonAttrs (_: {
+            doCheck = false;
+            doInstallCheck = false;
+            pytestCheckPhase = "true";
+          });
+
+        python = pkgs.python312.override {
+          self = python;
+          packageOverrides = _final: prev: {
+            fastapi = skipChecks prev.fastapi;
+            fastapi-cli = skipChecks prev.fastapi-cli;
+          };
+        };
 
         # Runtime dependencies, shared by the dev shell and the package.
         runtimeDeps = ps: with ps; [
@@ -75,14 +95,21 @@
           shellHook = ''
             export PYTHONPATH="$PWD:$PYTHONPATH"
             export ONTIME_ROOT="$PWD"
-            if [ ! -f .env ]; then
-              echo "ontime: no .env yet — cp .env.example .env and add your BODS key"
+
+            # direnv re-evaluates this hook on every cd into the directory, and
+            # a banner there is noise on an ordinary shell prompt. DIRENV_IN_ENVRC
+            # is set only while direnv is sourcing .envrc, so this prints for an
+            # explicit `nix develop` and stays quiet the rest of the time.
+            if [ -z "''${DIRENV_IN_ENVRC:-}" ]; then
+              if [ ! -f .env ]; then
+                echo "ontime: no .env yet — cp .env.example .env and add your BODS key"
+              fi
+              echo "ontime dev shell · python $(${pythonEnv}/bin/python -V 2>&1 | cut -d' ' -f2) · ruff $(${pkgs.ruff}/bin/ruff --version | cut -d' ' -f2)"
+              echo "  python -m ontime.ingest    build the timetable cache"
+              echo "  python -m ontime.web       serve the dashboard"
+              echo "  python -m ontime.history   derive stop events and relearn segments"
+              echo "  pytest -q                  run the test suite"
             fi
-            echo "ontime dev shell · python $(${pythonEnv}/bin/python -V 2>&1 | cut -d' ' -f2) · ruff $(${pkgs.ruff}/bin/ruff --version | cut -d' ' -f2)"
-            echo "  python -m ontime.ingest    build the timetable cache"
-            echo "  python -m ontime.web       serve the dashboard"
-            echo "  python -m ontime.history   derive stop events and relearn segments"
-            echo "  pytest -q                  run the test suite"
           '';
         };
 
