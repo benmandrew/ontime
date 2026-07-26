@@ -1,0 +1,205 @@
+"""Dashboard server: a background poller plus a small JSON and HTML frontend.
+
+The API key never leaves this process. The browser talks only to this server,
+which is why the page can be served over plain HTTP on the loopback interface
+without exposing the credential.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, JSONResponse
+
+from . import config, db, eta, history, siri
+from .matching import LONDON, Trip, load_trips, match
+
+STATIC = Path(__file__).parent / "static"
+
+
+class State:
+    """Everything the poller writes and the request handlers read."""
+
+    def __init__(self) -> None:
+        self.trips: list[Trip] = []
+        self.trips_for: date | None = None
+        self.segments: dict = {}
+        self.board: dict = {"stops": [], "updated": None, "error": None}
+        self.vehicles: list = []
+        self.last_poll: float | None = None
+        self.routes: set[str] = set()
+
+
+state = State()
+
+
+def refresh_timetable(conn) -> None:
+    today = datetime.now(LONDON).date()
+    if state.trips_for == today:
+        return
+    days = (today, today - timedelta(days=1))
+    state.trips = load_trips(conn, days)
+    state.trips_for = today
+    state.routes = {t.route_name for t in state.trips}
+    state.segments = history.load_segment_stats(conn)
+    print(
+        f"[timetable] {len(state.trips)} trips for {today}, "
+        f"routes {sorted(state.routes)}, "
+        f"{len(state.segments)} learned segments"
+    )
+
+
+def build_board(conn) -> dict:
+    now = datetime.now(UTC).timestamp()
+    vehicles = siri.fetch(routes=state.routes)
+
+    preds: list[eta.Prediction] = []
+    matched_ids: set[str] = set()
+    live_vehicles = []
+
+    for v in vehicles:
+        trip = match(v, state.trips)
+        history.record(conn, v, trip.trip_id if trip else None)
+        if trip is None:
+            continue
+        matched_ids.add(trip.trip_id)
+        live_vehicles.append(
+            {
+                "vehicle_ref": v.vehicle_ref,
+                "route": v.route_name,
+                "lat": v.lat,
+                "lon": v.lon,
+                "bearing": v.bearing,
+                "headsign": trip.headsign or v.dest_name,
+                "age_secs": round(v.age_secs),
+            }
+        )
+        for stop in config.STOPS:
+            p = eta.predict(v, trip, stop.atco, state.segments, now=now)
+            if p and p.minutes is not None and -1 <= p.minutes <= config.HORIZON_SECS / 60:
+                preds.append(p)
+    conn.commit()
+
+    preds += eta.scheduled_only(state.trips, matched_ids, now, config.HORIZON_SECS)
+
+    stops_out = []
+    for stop in config.STOPS:
+        rows = sorted(
+            (p for p in preds if p.stop_id == stop.atco), key=lambda p: p.eta_ts or 0
+        )[:12]
+        stops_out.append(
+            {
+                "atco": stop.atco,
+                "naptan": stop.naptan,
+                "name": stop.name,
+                "detail": stop.detail,
+                "departures": [
+                    {
+                        "route": p.route_name,
+                        "headsign": p.headsign,
+                        "minutes": round(p.minutes) if p.minutes is not None else None,
+                        "eta_ts": p.eta_ts,
+                        "sched_ts": p.sched_ts,
+                        "delay_mins": round(p.delay_secs / 60) if p.delay_secs else None,
+                        "source": p.source,
+                        "coverage": round(p.learned_coverage, 2),
+                        "vehicle": p.vehicle_ref,
+                        "stops_away": p.stops_away,
+                    }
+                    for p in rows
+                ],
+            }
+        )
+
+    return {
+        "stops": stops_out,
+        "vehicles": live_vehicles,
+        "updated": now,
+        "counts": {"feed": len(vehicles), "matched": len(live_vehicles)},
+        "history": history.stats_summary(conn),
+        "error": None,
+    }
+
+
+async def poller() -> None:
+    conn = db.connect()
+    db.init(conn)
+    while True:
+        try:
+            refresh_timetable(conn)
+            state.board = await asyncio.to_thread(build_board, conn)
+            c = state.board["counts"]
+            print(f"[poll] feed={c['feed']} matched={c['matched']}")
+        except Exception as exc:  # keep the loop alive
+            msg = config.redact(str(exc))
+            print(f"[poll] error: {msg}")
+            state.board = {**state.board, "error": msg}
+        await asyncio.sleep(config.POLL_SECS)
+
+
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    task = asyncio.create_task(poller())
+    yield
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+app = FastAPI(title="ontime", lifespan=lifespan)
+
+
+@app.get("/api/board")
+async def api_board() -> JSONResponse:
+    return JSONResponse(state.board)
+
+
+@app.get("/healthz")
+async def healthz() -> JSONResponse:
+    """Liveness for the container healthcheck and for `tailscale serve` probes."""
+    fresh = state.board.get("updated") is not None and datetime.now(
+        UTC
+    ).timestamp() - state.board["updated"] < max(120, config.POLL_SECS * 4)
+    body = {
+        "ok": fresh,
+        "updated": state.board.get("updated"),
+        "error": state.board.get("error"),
+    }
+    return JSONResponse(body, status_code=200 if fresh else 503)
+
+
+@app.get("/api/stops")
+async def api_stops() -> JSONResponse:
+    return JSONResponse(
+        [
+            {
+                "atco": s.atco,
+                "naptan": s.naptan,
+                "name": s.name,
+                "detail": s.detail,
+            }
+            for s in config.STOPS
+        ]
+    )
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(STATIC / "dashboard.html")
+
+
+def main() -> None:
+    import uvicorn
+
+    if not config.DB_PATH.exists():
+        raise SystemExit("No timetable cache. Run: python -m ontime.ingest")
+    config.api_key()  # fail fast if the key is missing
+    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

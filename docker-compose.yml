@@ -1,0 +1,45 @@
+# Two services over one volume: the dashboard stays responsive while the
+# maintenance loop does the slow work (90MB timetable refresh, relearning).
+#
+# The published port is bound to loopback on purpose. Nothing is exposed to the
+# LAN — `tailscale serve` is what puts it on the tailnet. See README.md.
+
+services:
+  web:
+    build: .
+    image: ontime:latest
+    container_name: ontime-web
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      ONTIME_DATA_DIR: /data
+      ONTIME_HOST: 0.0.0.0
+      ONTIME_PORT: "8000"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ontime-data:/data
+    depends_on:
+      maintenance:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
+
+  maintenance:
+    build: .
+    image: ontime:latest
+    container_name: ontime-maintenance
+    restart: unless-stopped
+    command: ["python", "-m", "ontime.maintenance"]
+    env_file: [.env]
+    environment:
+      ONTIME_DATA_DIR: /data
+    volumes:
+      - ontime-data:/data
+
+volumes:
+  ontime-data:

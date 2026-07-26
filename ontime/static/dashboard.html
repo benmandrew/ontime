@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ontime — live departures</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --ink: #e8eaf0; --dim: #939aab; --accent: #ffd166;
+    --live: #4ade80; --late: #f87171; --sched: #64748b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --line: #e2e5ea;
+      --ink: #14161b; --dim: #5f6672; --accent: #b4700a;
+      --live: #15803d; --late: #b91c1c; --sched: #6b7280;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.25rem; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  h1 { font-size: 1.15rem; margin: 0; letter-spacing: .01em; }
+  .meta { color: var(--dim); font-size: .8rem; }
+  .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .card h2 { font-size: .95rem; margin: 0; padding: .7rem .9rem .15rem; }
+  .card .sub { padding: 0 .9rem .6rem; color: var(--dim); font-size: .75rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); font-weight: 600; padding: .4rem .9rem; border-top: 1px solid var(--line); }
+  td { padding: .42rem .9rem; border-top: 1px solid var(--line); vertical-align: baseline; }
+  tr:hover td { background: rgba(127,127,127,.07); }
+  .route { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .dest { color: var(--ink); }
+  .due { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; white-space: nowrap; }
+  .tag { font-size: .62rem; text-transform: uppercase; letter-spacing: .05em;
+         padding: .08rem .34rem; border-radius: 4px; border: 1px solid currentColor; }
+  .t-learned { color: var(--live); } .t-timetable { color: var(--accent); } .t-scheduled { color: var(--sched); }
+  .late { color: var(--late); } .early { color: var(--live); }
+  .empty { padding: .9rem; color: var(--dim); font-size: .85rem; }
+  footer { margin-top: 1.1rem; color: var(--dim); font-size: .75rem; }
+  .err { background: #7f1d1d; color: #fff; padding: .5rem .8rem; border-radius: 8px; margin-bottom: .8rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ontime</h1>
+  <span class="meta" id="meta">connecting…</span>
+</header>
+<div id="err"></div>
+<div class="grid" id="grid"></div>
+<footer id="foot"></footer>
+
+<script>
+const fmtClock = ts => new Date(ts * 1000).toLocaleTimeString('en-GB',
+  { hour: '2-digit', minute: '2-digit' });
+
+function due(d) {
+  if (d.minutes === null) return '—';
+  if (d.minutes <= 0) return 'due';
+  if (d.minutes < 60) return d.minutes + ' min';
+  return fmtClock(d.eta_ts);
+}
+
+function delayCell(d) {
+  if (d.source === 'scheduled' || d.delay_mins === null) return '';
+  if (Math.abs(d.delay_mins) < 2) return '<span class="early">on time</span>';
+  return d.delay_mins > 0
+    ? `<span class="late">${d.delay_mins} late</span>`
+    : `<span class="early">${-d.delay_mins} early</span>`;
+}
+
+function render(data) {
+  document.getElementById('err').innerHTML = data.error
+    ? `<div class="err">${data.error}</div>` : '';
+
+  document.getElementById('grid').innerHTML = data.stops.map(s => `
+    <div class="card">
+      <h2>${s.name}</h2>
+      <div class="sub">${s.detail} · <code>${s.naptan}</code> · <code>${s.atco}</code></div>
+      ${s.departures.length ? `
+      <table>
+        <thead><tr><th>Svc</th><th>Towards</th><th>Status</th><th style="text-align:right">Due</th></tr></thead>
+        <tbody>${s.departures.map(d => `
+          <tr>
+            <td class="route">${d.route}</td>
+            <td class="dest">${d.headsign || ''}
+              <span class="tag t-${d.source}">${d.source === 'scheduled' ? 'timetable' : d.source === 'learned' ? 'learned' : 'est'}</span>
+            </td>
+            <td>${delayCell(d)}</td>
+            <td class="due">${due(d)}</td>
+          </tr>`).join('')}</tbody>
+      </table>` : '<div class="empty">Nothing due within the horizon.</div>'}
+    </div>`).join('');
+
+  const c = data.counts || {}, h = data.history || {};
+  document.getElementById('meta').textContent =
+    `updated ${fmtClock(data.updated)} · ${c.matched}/${c.feed} vehicles matched`;
+  document.getElementById('foot').textContent =
+    `History: ${(h.observations || 0).toLocaleString()} positions over ${h.history_days || 0} days · ` +
+    `${(h.stop_events || 0).toLocaleString()} stop events · ${h.learned_segments || 0} learned segments. ` +
+    `Green "learned" rows use observed run-times; amber "est" rows fall back to the timetable.`;
+}
+
+async function tick() {
+  try {
+    const r = await fetch('/api/board');
+    render(await r.json());
+  } catch (e) {
+    document.getElementById('meta').textContent = 'server unreachable';
+  }
+}
+tick();
+setInterval(tick, 10000);
+</script>
+</body>
+</html>

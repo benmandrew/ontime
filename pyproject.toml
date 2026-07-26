@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ontime"
+version = "0.1.0"
+description = "Private live-departures dashboard for Greater Manchester bus stops"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "httpx>=0.27", "ruff>=0.6", "mypy>=1.11"]
+
+[project.scripts]
+ontime = "ontime.web:main"
+
+[tool.setuptools.packages.find]
+include = ["ontime*"]
+
+[tool.setuptools.package-data]
+ontime = ["static/*.html"]
+
+[tool.ruff]
+line-length = 92
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "RUF", "ARG", "PTH"]
+ignore = [
+    "E501",    # line length is handled by the formatter
+    "B008",    # FastAPI dependency injection idiom
+    "RUF012",  # mutable class attrs on plain state holders are fine here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002", "S101"]
+"scripts/*" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+ignore_missing_imports = true
+check_untyped_defs = true
+exclude = ["^tests/", "^scripts/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+markers = [
+    "e2e: end-to-end tests covering ingest, matching, prediction and the HTTP API",
+    "live: tests that hit the real BODS feed (require BODS_API_KEY; deselected by default)",
+]
+filterwarnings = ["error::DeprecationWarning"]
