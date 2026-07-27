@@ -146,12 +146,13 @@ class TestMainLoop:
         assert counts["learn"] >= 2, "must retry after a failure"
         assert calls["sleep"] == 3
 
-    def test_error_output_is_redacted(self, cache, monkeypatch, api_key, capsys):
+    def test_error_output_is_redacted(self, cache, monkeypatch, api_key, caplog):
         def leaky_learn():
             raise RuntimeError(f"GET /datafeed/?api_key={api_key} failed")
 
-        self._run(monkeypatch, ticks=1, ingest_fn=lambda: None, learn_fn=leaky_learn)
+        with caplog.at_level("ERROR"):
+            self._run(monkeypatch, ticks=1, ingest_fn=lambda: None, learn_fn=leaky_learn)
 
-        out = capsys.readouterr().out
+        out = caplog.text
         assert api_key not in out
         assert "<redacted>" in out

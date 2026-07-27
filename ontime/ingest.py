@@ -21,9 +21,12 @@ from datetime import date
 
 import requests
 
-from . import config, db
+from . import config, db, logs
+
+log = logs.get("ontime.ingest")
 
 CHUNK = 1 << 20
+LOG_EVERY_BYTES = 20 << 20
 
 
 def parse_gtfs_time(value: str) -> int | None:
@@ -45,28 +48,30 @@ def download(force: bool = False) -> None:
     )
     if fresh and not force:
         mb = config.GTFS_ZIP.stat().st_size / 1e6
-        print(f"  using cached {config.GTFS_ZIP.name} ({mb:.0f}MB, <20h old)")
+        log.info("using cached %s (%.0fMB, under 20h old)", config.GTFS_ZIP.name, mb)
         return
 
-    print(f"  downloading {config.GTFS_URL}")
+    log.info("downloading %s", config.GTFS_URL)
     tmp = config.GTFS_ZIP.with_suffix(".part")
     with requests.get(config.GTFS_URL, stream=True, timeout=300) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length", 0))
         done = 0
+        last_logged = 0
         with tmp.open("wb") as fh:
             for chunk in r.iter_content(CHUNK):
                 fh.write(chunk)
                 done += len(chunk)
-                if total:
-                    pct = 100 * done / total
-                    print(
-                        f"\r  {done / 1e6:6.1f}/{total / 1e6:.0f}MB ({pct:4.1f}%)",
-                        end="",
-                        flush=True,
+                if total and done - last_logged >= LOG_EVERY_BYTES:
+                    last_logged = done
+                    log.info(
+                        "  %.0f/%.0fMB (%.0f%%)",
+                        done / 1e6,
+                        total / 1e6,
+                        100 * done / total,
                     )
-    print()
     tmp.replace(config.GTFS_ZIP)
+    log.info("downloaded %.0fMB", done / 1e6)
 
 
 def rows(zf: zipfile.ZipFile, name: str) -> Iterator[dict[str, str]]:
@@ -89,15 +94,11 @@ def build() -> None:
         cur.execute(f"DELETE FROM {table}")
 
     with zipfile.ZipFile(config.GTFS_ZIP) as zf:
-        print("  pass 1/2: finding trips that call at the watched stops")
+        log.info("pass 1/2: finding trips that call at the watched stops")
         target: dict[str, list[tuple[str, int, int | None]]] = {}
         for i, r in enumerate(rows(zf, "stop_times.txt")):
             if i and i % 2_000_000 == 0:
-                print(
-                    f"\r    {i / 1e6:.0f}M rows scanned, {len(target)} trips hit",
-                    end="",
-                    flush=True,
-                )
+                log.info("  %dM rows scanned, %d trips hit", i / 1e6, len(target))
             if r["stop_id"] in config.STOP_IDS:
                 target.setdefault(r["trip_id"], []).append(
                     (
@@ -106,9 +107,9 @@ def build() -> None:
                         parse_gtfs_time(r["arrival_time"]),
                     )
                 )
-        print(f"\r    {len(target)} trips call at the watched stops" + " " * 20)
+        log.info("%d trips call at the watched stops", len(target))
 
-        print("  pass 2/2: collecting full stop sequences for those trips")
+        log.info("pass 2/2: collecting full stop sequences for those trips")
         seq_rows = []
         for r in rows(zf, "stop_times.txt"):
             if r["trip_id"] in target:
@@ -126,7 +127,7 @@ def build() -> None:
             "VALUES (?,?,?,?,?)",
             seq_rows,
         )
-        print(f"    {len(seq_rows)} stop_times cached")
+        log.info("%d stop_times cached", len(seq_rows))
 
         routes = {
             r["route_id"]: r.get("route_short_name") or r.get("route_long_name", "")
@@ -146,7 +147,7 @@ def build() -> None:
             if r["stop_id"] in needed_stops
         ]
         cur.executemany("INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?)", stop_rows)
-        print(f"    {len(stop_rows)} stops cached")
+        log.info("%d stops cached", len(stop_rows))
 
         # Endpoints of each trip, used as the strongest matching key against
         # the live feed's OriginRef / DestinationRef / OriginAimedDepartureTime.
@@ -185,7 +186,7 @@ def build() -> None:
         cur.executemany(
             "INSERT OR REPLACE INTO trips VALUES (?,?,?,?,?,?,?,?,?)", trip_rows
         )
-        print(f"    {len(trip_rows)} trips cached")
+        log.info("%d trips cached", len(trip_rows))
 
         services = {t[1] for t in trip_rows}
         cal = [
@@ -212,13 +213,13 @@ def build() -> None:
             if r["service_id"] in services
         ]
         cur.executemany("INSERT OR REPLACE INTO calendar_dates VALUES (?,?,?)", cd)
-        print(f"    {len(cal)} calendar + {len(cd)} exception rows cached")
+        log.info("%d calendar + %d exception rows cached", len(cal), len(cd))
 
         calls = [
             (tid, sid, seq, arr) for tid, items in target.items() for sid, seq, arr in items
         ]
         cur.executemany("INSERT OR REPLACE INTO target_calls VALUES (?,?,?,?)", calls)
-        print(f"    {len(calls)} scheduled calls at the watched stops")
+        log.info("%d scheduled calls at the watched stops", len(calls))
 
     cur.execute(
         "INSERT OR REPLACE INTO meta VALUES ('built_at', ?)", (date.today().isoformat(),)
@@ -228,11 +229,12 @@ def build() -> None:
 
 
 def main() -> None:
+    logs.setup()
     force = "--force" in sys.argv
-    print("Building timetable cache")
+    log.info("building timetable cache")
     download(force=force)
     build()
-    print(f"Done. Cache at {config.DB_PATH}")
+    log.info("done, cache at %s", config.DB_PATH)
 
 
 if __name__ == "__main__":

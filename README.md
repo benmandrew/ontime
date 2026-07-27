@@ -47,7 +47,7 @@ python -m ontime.web      # http://127.0.0.1:8000
 
 Registration for a free key takes a minute at [data.bus-data.dft.gov.uk](https://data.bus-data.dft.gov.uk/account/signup/).
 
-The flake disables the check phase on `fastapi`. Nixpkgs has no binary cache coverage for it on `aarch64-darwin`, so it builds from source, and running its upstream test suite pulls in `scipy`, `pint` and `uncertainties`. Compiling scipy on Apple silicon turned a 12-second shell into the better part of an hour, all to re-verify a release upstream had already tested. Skipping it drops the build list from 12 derivations to 3.
+Entering the shell takes about 10 seconds and builds two derivations. It briefly took considerably longer: nixpkgs has no binary cache coverage for `fastapi` on `aarch64-darwin`, so it built from source, and running its upstream test suite pulled in `scipy`. Dropping fastapi for starlette removed the cause rather than papering over it.
 
 ### Docker, behind Tailscale
 
@@ -56,6 +56,8 @@ The compose file runs two services over one named volume. The dashboard polls an
 ```sh
 docker compose up -d --build
 ```
+
+Both services share the named `ontime-data` volume, which is deliberate rather than incidental. Two processes on one SQLite database is fine on a real filesystem in write-ahead logging mode, and the web container polling while the maintenance container rebuilds was verified to stay healthy. Substituting a bind mount is not safe on macOS: concurrent access over a Docker Desktop bind mount produced a `SIGBUS` during a rebuild.
 
 The published port binds to `127.0.0.1` deliberately — nothing reaches the local network. Putting it on the tailnet is a separate, explicit step:
 
@@ -79,12 +81,40 @@ Measured on Apple silicon against the real feed and the full North West archive,
 | Duty cycle at a 15-second poll | under 3% |
 | Resident memory | 60 MB |
 | Position history | roughly 8 MB a day, 165 MB at the 21-day retention |
+| Container image | 62.4 MB uncompressed, 19.6 MB transferred |
 
 Matching is cheap because the first tier — origin stop, destination stop and aimed departure time — almost always hits, so the geometric fallback that walks every candidate path rarely runs.
 
 Indices are deliberately sparse. Each was checked with `EXPLAIN QUERY PLAN` against a real cache, and four that no query reached were removed: one unused index on `observations` alone cost 45% more insert time, 430 ms against 297 ms per 200,000 rows, and inserting is the hot path. The remaining full-table scans are intentional, either because the caller wants every row or because the table holds a few hundred of them.
 
 Reducing raw positions to per-stop events scans only the last 26 hours. That step is idempotent, so older positions have already been reduced, and rescanning the full retention window hourly would mean loading hundreds of thousands of rows to rewrite results that cannot have changed.
+
+### Image size
+
+The image went from 220 MB to 62.4 MB in three steps, and gzips to 19.6 MB, which is what a pull actually transfers.
+
+**Base.** Debian slim was 109 MB of the original against a 14 MB virtualenv, so the base was almost the whole cost. Alpine took it to 97 MB. Every dependency publishes a musllinux wheel and `--only-binary=:all:` enforces that, so a missing one fails the build rather than quietly compiling Rust.
+
+**Framework.** Nothing here used a fastapi feature — no request models, no dependency injection, no generated schema — only routing and responses, which belong to starlette underneath. The pydantic it pulled in was 8.6 MB of the virtualenv and the only compiled dependency in the image. Starlette was already present as a transitive dependency, so the swap removed 12 MB and a portability risk together, and took the image to 85.9 MB.
+
+**Layers.** The last 23 MB came from understanding why the first attempt at trimming did nothing. Deleting a file that arrived in a lower layer reclaims no space: it writes a whiteout and the original bytes stay. Pruning the interpreter in a `FROM python:3.12-alpine` runtime stage measurably made things worse — 336 kB of whiteouts on top of a 48.1 MB CPython layer that still held every byte. Moving the pruning into the builder, which is discarded, and starting the runtime from bare Alpine so it copies only what survived, is what actually reclaimed it.
+
+What remains is close to the floor for a CPython application: roughly 20 MB of interpreter and standard library, 12 MB of musl and OpenSSL and SQLite, 9 MB of Alpine, 7 MB of `libpython`, 6 MB of virtualenv and 2 MB of timezone data. Going further would mean pruning standard-library C extensions or shipping only the timezones this application names, which trades a little size for a class of import failure that would not show up until it did.
+
+The coupling this buys is recorded in the Dockerfile: `ALPINE_VERSION` must track whatever Alpine `python:3.12-alpine` is built on, or the copied interpreter meets a different musl.
+
+## Logging
+
+Everything goes through `ontime/logs.py` on stdout, with ISO-8601 timestamps in UTC:
+
+```
+2026-07-27T00:08:46.198Z INFO     ontime.web       poll: feed=35 matched=31
+2026-07-27T00:08:46.199Z ERROR    ontime.web       poll failed: GET /datafeed/?api_key=<redacted> timed out
+```
+
+UTC rather than local time, because container logs get read from other timezones and the feed's own `RecordedAtTime` is UTC — a mixed-zone log makes staleness arithmetic needlessly confusing. Uvicorn's own loggers are re-pointed at the same handler so the output stays uniform. `ONTIME_LOG_LEVEL` sets the threshold.
+
+Every record passes a filter that strips the API key. Call sites already redact explicitly; the filter catches anything added later that forgets to.
 
 ## Configuration
 
@@ -99,6 +129,7 @@ Every setting is an environment variable, listed in `.env.example`.
 | `ONTIME_HORIZON_SECS` | `3600` | How far ahead the board looks. |
 | `ONTIME_RETAIN_DAYS` | `21` | Raw position retention. Aggregates outlive it. |
 | `ONTIME_DATA_DIR` | `./data` | Cache location, set to `/data` in the container. |
+| `ONTIME_LOG_LEVEL` | `INFO` | Logging threshold. |
 
 Changing the watched stops means editing `STOPS` in `ontime/config.py` and re-running the ingest.
 
@@ -126,6 +157,7 @@ Fixtures are cut from real published data rather than invented — `tests/fixtur
 
 ```
 ontime/config.py       settings, stop definitions, redaction
+ontime/logs.py         timestamped logging and the redaction filter
 ontime/db.py           SQLite schema
 ontime/ingest.py       GTFS download and cache build
 ontime/siri.py         feed fetch and parse

@@ -10,10 +10,12 @@ from __future__ import annotations
 import sqlite3
 import time
 import traceback
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
-from . import config, db, history, ingest
+from . import config, db, history, ingest, logs
 from .matching import LONDON, load_trips
+
+log = logs.get("ontime.maint")
 
 # How often the loop wakes to check whether anything is due.
 TICK_SECS = 60
@@ -23,13 +25,13 @@ LEARN_INTERVAL = 3600
 
 
 def run_ingest() -> None:
-    print(f"[maint] {datetime.now(UTC).isoformat()} refreshing timetable")
+    log.info("refreshing timetable")
     ingest.download()
     ingest.build()
 
 
 def run_learn() -> None:
-    print(f"[maint] {datetime.now(UTC).isoformat()} relearning segments")
+    log.info("relearning segments")
     conn = db.connect()
     db.init(conn)
     today = datetime.now(LONDON).date()
@@ -38,9 +40,12 @@ def run_learn() -> None:
     events = history.derive_stop_events(conn, trips)
     segments = history.learn_segments(conn)
     removed = history.trim(conn, config.RETAIN_DAYS)
-    print(
-        f"[maint] events={events} segments={segments} trimmed={removed} "
-        f"{history.stats_summary(conn)}"
+    log.info(
+        "events=%d segments=%d trimmed=%d %s",
+        events,
+        segments,
+        removed,
+        history.stats_summary(conn),
     )
     conn.close()
 
@@ -67,6 +72,7 @@ def cache_is_current() -> bool:
 
 
 def main() -> None:
+    logs.setup()
     last_learn: float | None = None
     while True:
         try:
@@ -77,7 +83,7 @@ def main() -> None:
                 run_learn()
                 last_learn = now
         except Exception:
-            print("[maint] error:\n" + config.redact(traceback.format_exc()))
+            log.error("cycle failed:\n%s", config.redact(traceback.format_exc()))
         time.sleep(TICK_SECS)
 
 

@@ -11,31 +11,16 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # nixpkgs has no binary cache coverage for fastapi on aarch64-darwin,
-        # so it builds from source — and building it runs its upstream test
-        # suite, which drags in scipy, pint and uncertainties. Compiling scipy
-        # on Apple silicon turns a two-minute shell into the better part of an
-        # hour, to re-verify a release upstream already tested. Disabling the
-        # check phase drops those inputs from the closure entirely.
-        skipChecks = drv:
-          drv.overridePythonAttrs (_: {
-            doCheck = false;
-            doInstallCheck = false;
-            pytestCheckPhase = "true";
-          });
-
-        python = pkgs.python312.override {
-          self = python;
-          packageOverrides = _final: prev: {
-            fastapi = skipChecks prev.fastapi;
-            fastapi-cli = skipChecks prev.fastapi-cli;
-          };
-        };
+        # This used to carry an override disabling fastapi's check phase, which
+        # had no darwin binary cache and dragged scipy into the closure through
+        # its test dependencies — an hour-long shell. Dropping fastapi for
+        # starlette removed the problem at the root, so no override is needed.
+        python = pkgs.python312;
 
         # Runtime dependencies, shared by the dev shell and the package.
         runtimeDeps = ps: with ps; [
           requests
-          fastapi
+          starlette
           uvicorn
           python-dotenv
         ];

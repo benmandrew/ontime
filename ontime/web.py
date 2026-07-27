@@ -12,13 +12,16 @@ import contextlib
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse
+from starlette.routing import Route
 
-from . import config, db, eta, history, siri
+from . import config, db, eta, history, logs, siri
 from .matching import LONDON, Trip, load_trips, match
 
 STATIC = Path(__file__).parent / "static"
+log = logs.get("ontime.web")
 
 
 class State:
@@ -46,8 +49,11 @@ def refresh_timetable(conn) -> None:
     state.trips = load_trips(conn, days)
     state.trips_for = today
     state.routes = {t.route_name for t in state.trips}
-    print(
-        f"[timetable] {len(state.trips)} trips for {today}, routes {sorted(state.routes)}"
+    log.info(
+        "timetable loaded: %d trips for %s, routes %s",
+        len(state.trips),
+        today,
+        sorted(state.routes),
     )
 
 
@@ -158,10 +164,10 @@ async def poll_and_store() -> None:
     try:
         state.board = await asyncio.to_thread(poll_once)
         c = state.board["counts"]
-        print(f"[poll] feed={c['feed']} matched={c['matched']}")
+        log.info("poll: feed=%d matched=%d", c["feed"], c["matched"])
     except Exception as exc:  # a bad poll must not stop the loop
         msg = config.redact(str(exc))
-        print(f"[poll] error: {msg}")
+        log.error("poll failed: %s", msg)
         state.board = {**state.board, "error": msg}
 
 
@@ -172,7 +178,7 @@ async def poller() -> None:
 
 
 @contextlib.asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(_app: Starlette):
     # Warm the board before accepting traffic, so the first request is not
     # answered with an empty page and /healthz means something immediately.
     await poll_and_store()
@@ -183,16 +189,11 @@ async def lifespan(_app: FastAPI):
         await task
 
 
-app = FastAPI(title="ontime", lifespan=lifespan)
-
-
-@app.get("/api/board")
-async def api_board() -> JSONResponse:
+async def api_board(_request: Request) -> JSONResponse:
     return JSONResponse(state.board)
 
 
-@app.get("/healthz")
-async def healthz() -> JSONResponse:
+async def healthz(_request: Request) -> JSONResponse:
     """Liveness for the container healthcheck and for `tailscale serve` probes."""
     fresh = state.board.get("updated") is not None and datetime.now(
         UTC
@@ -205,8 +206,7 @@ async def healthz() -> JSONResponse:
     return JSONResponse(body, status_code=200 if fresh else 503)
 
 
-@app.get("/api/stops")
-async def api_stops() -> JSONResponse:
+async def api_stops(_request: Request) -> JSONResponse:
     return JSONResponse(
         [
             {
@@ -220,18 +220,35 @@ async def api_stops() -> JSONResponse:
     )
 
 
-@app.get("/")
-async def index() -> FileResponse:
+async def index(_request: Request) -> FileResponse:
     return FileResponse(STATIC / "dashboard.html")
+
+
+# Starlette rather than FastAPI. Nothing here uses a FastAPI feature — no
+# request models, no dependency injection, no generated schema — and the
+# pydantic it pulls in was 8.6MB of a 14MB virtualenv, as well as the only
+# compiled dependency in the image.
+app = Starlette(
+    routes=[
+        Route("/", index),
+        Route("/api/board", api_board),
+        Route("/api/stops", api_stops),
+        Route("/healthz", healthz),
+    ],
+    lifespan=lifespan,
+)
 
 
 def main() -> None:
     import uvicorn
 
+    logs.setup()
+
     if not config.DB_PATH.exists():
         raise SystemExit("No timetable cache. Run: python -m ontime.ingest")
     config.api_key()  # fail fast if the key is missing
-    uvicorn.run(app, host=config.HOST, port=config.PORT, log_level="warning")
+    log.info("serving on http://%s:%d", config.HOST, config.PORT)
+    uvicorn.run(app, host=config.HOST, port=config.PORT, log_config=None, access_log=False)
 
 
 if __name__ == "__main__":

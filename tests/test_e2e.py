@@ -12,7 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
-from fastapi.testclient import TestClient
+from starlette.testclient import TestClient
 
 from ontime import config, db, history, ingest, web
 from ontime.matching import LONDON

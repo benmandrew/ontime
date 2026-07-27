@@ -19,8 +19,10 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
-from . import config, db
+from . import config, db, logs
 from .matching import LONDON, Trip, haversine
+
+log = logs.get("ontime.history")
 
 # A position must come within this distance of a stop to count as passing it.
 STOP_RADIUS_M = 120.0
@@ -204,6 +206,7 @@ def stats_summary(conn: sqlite3.Connection) -> dict:
 
 def main() -> None:
     """Batch job: derive events, relearn segments, trim old positions."""
+    logs.setup()
     from .matching import load_trips
 
     conn = db.connect()
@@ -215,10 +218,13 @@ def main() -> None:
     events = derive_stop_events(conn, trips)
     segments = learn_segments(conn)
     removed = trim(conn, config.RETAIN_DAYS)
-    print(f"stop events written: {events}")
-    print(f"segments learned:    {segments}")
-    print(f"old positions trimmed: {removed}")
-    print(stats_summary(conn))
+    log.info(
+        "stop events=%d segments=%d trimmed=%d %s",
+        events,
+        segments,
+        removed,
+        stats_summary(conn),
+    )
     conn.close()
 
 

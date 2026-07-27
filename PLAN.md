@@ -22,6 +22,9 @@
 - [x] Docker image verified: 220MB, non-root, no pip or dev tooling
 - [x] Container run against the live feed with a real key
 - [x] Profiled with `scripts/benchmark.py`; removed four dead indices
+- [x] Timestamped logging (ISO-8601 UTC) with key redaction as a handler filter
+- [x] Image 220MB to 62.4MB: alpine base, fastapi dropped for starlette, pruning
+      moved into the builder so deletions actually reclaim space
 
 ## In progress
 
