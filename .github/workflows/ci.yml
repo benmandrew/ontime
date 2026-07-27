@@ -1,0 +1,171 @@
+name: CI
+
+# Checks run first and everything else is gated on them: a build that ships an
+# image nobody has linted is worse than no build at all. The two architectures
+# then build in parallel on native runners and push by digest only, and a final
+# job stitches those digests into one tagged multi-architecture manifest.
+#
+# Building each architecture natively rather than emulating arm64 under QEMU is
+# the whole reason for the digest dance. Emulated pip installs are minutes of
+# interpreted syscalls; ubuntu-24.04-arm is real hardware. If this repository is
+# private and not on a plan that includes ARM runners, replace the runner with
+# ubuntu-latest and add a docker/setup-qemu-action@v3 step to the build job.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Written out rather than interpolated from the login secret, which GitHub would
+# mask to *** and make every tag and digest in the logs unreadable. The account
+# name is public on Docker Hub regardless.
+env:
+  IMAGE_NAME: benmandrew/ontime
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, format, types, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      # Each check runs even after an earlier one fails, so a single push shows
+      # every problem rather than one per round trip.
+      - name: ruff format
+        run: ruff format --check .
+
+      - name: ruff check
+        if: ${{ !cancelled() }}
+        run: ruff check .
+
+      - name: mypy
+        if: ${{ !cancelled() }}
+        run: mypy ontime
+
+      - name: pytest
+        if: ${{ !cancelled() }}
+        run: pytest -q
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # push-by-digest uploads the layers under a content address and no tag, so
+      # neither architecture can transiently claim :latest for itself. Only the
+      # manifest job names anything. Provenance attestations are off because they
+      # add a second manifest per architecture that imagetools would then have to
+      # merge alongside the real ones.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          provenance: false
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      # The digest is the entire payload; an empty file named after it is enough
+      # for the manifest job to reconstruct the reference.
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifest:
+    name: Push manifest
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create and push manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # Word splitting is the mechanism here, not an accident: both
+          # substitutions expand to lists of arguments.
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE_NAME}@sha256:%s " *)
+
+      - name: Inspect
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:${{ steps.meta.outputs.version }}"
