@@ -58,14 +58,20 @@ def main() -> None:
         return [(v, match(v, trips)) for v in vehicles]
 
     pairs, t_match = timed("match all vehicles", do_match)
-    matched = [(v, t) for v, t in pairs if t]
+    matched = [(v, m) for v, m in pairs if m]
     print(f"  matched: {len(matched)}/{len(vehicles)}")
 
     def do_predict():
         out = []
-        for v, trip in matched:
+        for v, m in matched:
             for stop in config.STOPS:
-                p = eta.predict(v, trip, stop.atco, segments)
+                p = eta.predict(
+                    v,
+                    m.trip,
+                    stop.atco,
+                    segments,
+                    schedule_confident=m.schedule_confident,
+                )
                 if p:
                     out.append(p)
         return out
@@ -76,33 +82,18 @@ def main() -> None:
     _, t_sched = timed(
         "scheduled_only fallback",
         lambda: eta.scheduled_only(
-            trips, {t.trip_id for _v, t in matched}, time.time(), config.HORIZON_SECS
+            trips, {m.trip.trip_id for _v, m in matched}, time.time(), config.HORIZON_SECS
         ),
     )
 
-    # A 00:45 sample understates the daytime cost, so replay the recorded
-    # busy-period fixture against the full timetable as well.
-    sample = ROOT / "tests" / "fixtures" / "siri_sample.xml"
-    if sample.exists():
-        busy = siri.parse(sample.read_bytes())
-        busy = [v for v in busy if v.route_name in routes]
-        print(f"\n  replaying recorded busy sample: {len(busy)} vehicles")
-        start = time.perf_counter()
-        busy_pairs = [(v, match(v, trips)) for v in busy]
-        t_busy = time.perf_counter() - start
-        hit = sum(1 for _v, t in busy_pairs if t)
-        print(
-            f"  match {len(busy)} vehicles                  {t_busy * 1000:8.1f} ms  ({hit} matched)"
-        )
-        if busy:
-            per = t_busy / len(busy)
-            print(f"  per vehicle                        {per * 1000:8.2f} ms")
-            print(f"  extrapolated to 40 vehicles        {per * 40 * 1000:8.0f} ms")
-            print(
-                f"  duty cycle at 40 vehicles, {config.POLL_SECS}s      {100 * per * 40 / config.POLL_SECS:.1f}%"
-            )
+    # The recorded fixture is only useful for cost while it is fresh: its
+    # vehicles' journeys finish, and matching them against a later day's
+    # timetable then measures rejection rather than matching.
+    per_vehicle = t_match / len(vehicles) if vehicles else 0
+    print(f"\n  per vehicle matched                {per_vehicle * 1000:8.2f} ms")
+    print(f"  extrapolated to 60 vehicles        {per_vehicle * 60 * 1000:8.0f} ms")
 
-    conn.close()
+    conn2 = conn
     cpu = t_match + t_predict + t_sched
     cycle = t_load + t_fetch + cpu
     print(f"\n  compute per cycle (excl. network): {cpu * 1000:.0f} ms")
@@ -112,12 +103,35 @@ def main() -> None:
     )
     print(f"  peak RSS:                          {rss_mb():.0f} MB")
 
-    daily = len(vehicles) * (86400 / 10)
-    print(f"\n  positions/day (deduped est.):      {daily:,.0f}")
-    print(f"  storage/day at ~90 B/row:          {daily * 90 / 1e6:.0f} MB")
-    print(
-        f"  at {config.RETAIN_DAYS}-day retention:               {daily * 90 * config.RETAIN_DAYS / 1e6:.0f} MB"
-    )
+    # Measured from accumulated history where there is any, because the naive
+    # "vehicles seen now, all day" extrapolation overstates it by an order of
+    # magnitude — the feed repeats a vehicle's RecordedAtTime between updates
+    # and those duplicates are dropped on insert.
+    row = conn2.execute(
+        "SELECT COUNT(*) c, MIN(recorded_at) a, MAX(recorded_at) b FROM observations"
+    ).fetchone()
+    span_h = (row["b"] - row["a"]) / 3600 if row["a"] and row["c"] else 0
+    print()
+    if span_h > 1:
+        used = (
+            conn2.execute(
+                "SELECT SUM(pgsize) FROM dbstat WHERE name='observations'"
+            ).fetchone()[0]
+            or 0
+        )
+        per_row = used / row["c"]
+        per_day = row["c"] / span_h * 24
+        print(f"  history measured over              {span_h:8.1f} h")
+        print(f"  rows/day (deduped, measured)       {per_day:8,.0f}")
+        print(f"  bytes/row incl. index              {per_row:8.0f}")
+        print(f"  storage/day                        {per_day * per_row / 1e6:8.1f} MB")
+        print(
+            f"  at {config.RETAIN_DAYS}-day retention               "
+            f"{per_day * per_row * config.RETAIN_DAYS / 1e6:8.0f} MB"
+        )
+    else:
+        print("  history: not enough accumulated yet to measure storage growth")
+    conn2.close()
 
 
 if __name__ == "__main__":

@@ -109,7 +109,9 @@ class TestMatcher:
 
         got = match(vehicle, load_trips(built_db, (today,)))
         assert got is not None
-        assert got.trip_id == trip.trip_id
+        assert got.trip.trip_id == trip.trip_id
+        assert got.tier == 1, "origin, destination and departure time should pin it exactly"
+        assert got.schedule_confident
 
     def test_returns_none_for_unknown_route(self, built_db):
         today = datetime.now(LONDON).date()
@@ -163,5 +165,123 @@ class TestMatcher:
         vehicle = siri.parse(siri_document([xml]))[0]
 
         got = match(vehicle, load_trips(built_db, (today,)))
-        assert got is not None and got.trip_id == trip.trip_id
+        assert got is not None and got.trip.trip_id == trip.trip_id
         assert vehicle.journey_ref == "604253"
+
+
+class TestDirectionGate:
+    """Regression cover for wrong-direction buses on the board.
+
+    A watched stop served in one direction only caches trips for that direction
+    — all 467 live 192 trips run towards Manchester, because MANADTDW is the
+    northwest-bound stop. Ten of thirty-six live 192s were bound for Stockport,
+    and the time-only tier assigned them to northbound runs. The dashboard then
+    showed arrivals for buses travelling away from the stop, one of them
+    "362 minutes early".
+    """
+
+    def _trip(self, conn):
+        return load_trip(
+            conn, any_trip_serving(conn, STOP_192), datetime.now(LONDON).date()
+        )
+
+    def test_vehicle_heading_the_other_way_is_rejected(self, built_db):
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        # Same route, same road, but bound for a stop behind it in this sequence.
+        behind = trip.stops[1][1]
+        xml = vehicle_on_trip(trip, len(trip.stops) - 3).replace(
+            f"<DestinationRef>{trip.dest_stop_id}</DestinationRef>",
+            f"<DestinationRef>{behind}</DestinationRef>",
+        )
+        vehicle = siri.parse(siri_document([xml]))[0]
+        assert match(vehicle, load_trips(built_db, (today,))) is None
+
+    def test_destination_this_timetable_never_serves_is_rejected(self, built_db):
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        xml = vehicle_on_trip(trip, 2).replace(
+            f"<DestinationRef>{trip.dest_stop_id}</DestinationRef>",
+            "<DestinationRef>1800NOWHERE1</DestinationRef>",
+        )
+        vehicle = siri.parse(siri_document([xml]))[0]
+        assert match(vehicle, load_trips(built_db, (today,))) is None
+
+    def test_vehicle_heading_our_way_still_matches(self, built_db):
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        vehicle = siri.parse(siri_document([vehicle_on_trip(trip, 2)]))[0]
+        got = match(vehicle, load_trips(built_db, (today,)))
+        assert got is not None and got.trip.trip_id == trip.trip_id
+
+    def test_intermediate_destination_is_accepted(self, built_db):
+        """A short working terminating part-way is still coming towards us."""
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        ahead = trip.stops[-2][1]
+        xml = vehicle_on_trip(trip, 1).replace(
+            f"<DestinationRef>{trip.dest_stop_id}</DestinationRef>",
+            f"<DestinationRef>{ahead}</DestinationRef>",
+        )
+        vehicle = siri.parse(siri_document([xml]))[0]
+        assert match(vehicle, load_trips(built_db, (today,))) is not None
+
+
+class TestMatchConfidence:
+    def test_tie_is_broken_on_departure_time_not_distance(self, built_db):
+        """Every trip on a route shares the road, so distance cannot choose.
+
+        Picking the geometrically closest path among candidates within the time
+        tolerance selected an essentially arbitrary run and reported delays of
+        20 to 45 minutes for buses running to time.
+        """
+        today = datetime.now(LONDON).date()
+        trips = load_trips(built_db, (today,))
+        trip = load_trip(built_db, any_trip_serving(built_db, STOP_192), today)
+        vehicle = siri.parse(siri_document([vehicle_on_trip(trip, 2)]))[0]
+
+        got = match(vehicle, trips)
+        assert got is not None
+        best_possible = min(
+            abs(t.first_dep - trip.first_dep)
+            for t in trips
+            if t.route_name == trip.route_name
+        )
+        assert abs(got.trip.first_dep - trip.first_dep) == best_possible
+
+    def test_schedule_confidence_gates_the_delay_claim(self, built_db):
+        from ontime import eta
+
+        today = datetime.now(LONDON).date()
+        trip = load_trip(built_db, any_trip_serving(built_db, STOP_192), today)
+        target = next(i for i, s in enumerate(trip.stops) if s[1] == STOP_192)
+        vehicle = siri.parse(siri_document([vehicle_on_trip(trip, target - 1)]))[0]
+
+        # Anchor `now` near the scheduled arrival, so the delay this produces is
+        # a plausible one and is not suppressed for being absurd.
+        now = eta.sched_timestamp(trip, trip.stops[target][2]) - 120
+
+        confident = eta.predict(
+            vehicle, trip, STOP_192, {}, now=now, schedule_confident=True
+        )
+        unsure = eta.predict(vehicle, trip, STOP_192, {}, now=now, schedule_confident=False)
+
+        assert confident.delay_secs is not None
+        assert unsure.delay_secs is None, "an unidentified run must not claim a delay"
+        # The arrival itself is positional, so it survives either way.
+        assert unsure.minutes == pytest.approx(confident.minutes)
+
+    def test_implausible_delay_is_suppressed(self, built_db):
+        """Six hours out is a mismatched trip, not a late bus."""
+        from ontime import eta
+
+        today = datetime.now(LONDON).date()
+        trip = load_trip(built_db, any_trip_serving(built_db, STOP_192), today)
+        vehicle = siri.parse(siri_document([vehicle_on_trip(trip, 1)]))[0]
+        target = next(i for i, s in enumerate(trip.stops) if s[1] == STOP_192)
+
+        shifted = eta.sched_timestamp(trip, trip.stops[target][2])
+        p = eta.predict(
+            vehicle, trip, STOP_192, {}, now=shifted + 6 * 3600, schedule_confident=True
+        )
+        assert p is None or p.delay_secs is None

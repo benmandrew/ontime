@@ -78,9 +78,10 @@ def build_board(conn) -> dict:
     live_vehicles = []
 
     for v in vehicles:
-        trip = match(v, state.trips)
+        found = match(v, state.trips)
+        trip = found.trip if found else None
         history.record(conn, v, trip.trip_id if trip else None)
-        if trip is None:
+        if found is None or trip is None:
             continue
         matched_ids.add(trip.trip_id)
         live_vehicles.append(
@@ -95,7 +96,14 @@ def build_board(conn) -> dict:
             }
         )
         for stop in config.STOPS:
-            p = eta.predict(v, trip, stop.atco, state.segments, now=now)
+            p = eta.predict(
+                v,
+                trip,
+                stop.atco,
+                state.segments,
+                now=now,
+                schedule_confident=found.schedule_confident,
+            )
             if p and p.minutes is not None and -1 <= p.minutes <= config.HORIZON_SECS / 60:
                 preds.append(p)
     conn.commit()
@@ -183,10 +191,12 @@ async def lifespan(_app: Starlette):
     # answered with an empty page and /healthz means something immediately.
     await poll_and_store()
     task = asyncio.create_task(poller())
-    yield
-    task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
-        await task
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def api_board(_request: Request) -> JSONResponse:

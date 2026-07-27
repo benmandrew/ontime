@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -52,6 +53,19 @@ class Trip:
     first_dep: int
     service_date: date
     stops: list[tuple[int, str, int | None, float, float]]  # seq, stop_id, arr, lat, lon
+
+    @property
+    def index_of(self) -> dict[str, int]:
+        """Stop id to position in the sequence, built once per trip."""
+        cached = getattr(self, "_index_of", None)
+        if cached is None:
+            cached = {s[1]: i for i, s in enumerate(self.stops)}
+            object.__setattr__(self, "_index_of", cached)
+        return cached
+
+    @property
+    def stop_ids(self) -> Iterable[str]:
+        return self.index_of.keys()
 
 
 def _runs_on(conn: sqlite3.Connection, service_id: str, day: date) -> bool:
@@ -145,11 +159,72 @@ def nearest_on_trip(trip: Trip, lat: float, lon: float) -> tuple[int, float, int
     return best_i, best_d, trip.stops[best_i][0]
 
 
-def match(vehicle: Vehicle, candidates: list[Trip]) -> Trip | None:
+@dataclass(frozen=True)
+class Match:
+    """A matched trip, and how much the schedule side of it can be trusted."""
+
+    trip: Trip
+    tier: int
+    dep_delta: float  # seconds between aimed and timetabled departure
+
+    @property
+    def schedule_confident(self) -> bool:
+        """Whether this match pins down *which* run the vehicle is on.
+
+        A tier-4 match knows only that the vehicle is somewhere on this route's
+        path. That is enough to estimate an arrival, because every trip on a
+        route follows the same stops, but not to say whether it is running
+        late — the scheduled time would come from an arbitrary run.
+        """
+        return self.tier <= 3 and self.dep_delta <= TIER3_TOL
+
+
+def _dest_is_downstream(trip: Trip, dest_ref: str, anchor_stop_id: str) -> bool:
+    """Whether `dest_ref` lies ahead of `anchor_stop_id` on this trip.
+
+    This is the direction test. A route's two directions are separate trips,
+    and only one of them is cached when a watched stop is served in a single
+    direction: all 467 cached trips for the 192 run towards Manchester,
+    because MANADTDW is the northwest-bound stop. Ten of thirty-six live 192s
+    were heading to Stockport, and a time-only match happily assigned them to
+    a northbound run, which is where "362 minutes early" came from.
+
+    Comparing terminus identifiers is not enough on its own, because a terminus
+    often shares one ATCO code between directions — Hazel Grove Park and Ride
+    does. Requiring the destination to come *after* the vehicle's position
+    separates them properly.
+
+    The anchor is resolved once per vehicle rather than per candidate. Trips on
+    one route follow one corridor, so the nearest stop is the same whichever of
+    them is measured against, and this turns a haversine over every candidate's
+    every stop into two dictionary lookups.
+    """
+    here = trip.index_of.get(anchor_stop_id)
+    there = trip.index_of.get(dest_ref)
+    return here is not None and there is not None and there > here
+
+
+def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
     """Best timetabled trip for a live vehicle, or None if nothing fits."""
     pool = [t for t in candidates if t.route_name == vehicle.route_name]
     if not pool:
         return None
+
+    if vehicle.dest_ref:
+        serving = [t for t in pool if vehicle.dest_ref in t.index_of]
+        if not serving:
+            return None
+        _pos, _d, _s = nearest_on_trip(serving[0], vehicle.lat, vehicle.lon)
+        anchor = serving[0].stops[_pos][1]
+        heading_there = [
+            t for t in serving if _dest_is_downstream(t, vehicle.dest_ref, anchor)
+        ]
+        if not heading_there:
+            # Going somewhere this timetable does not reach from here: another
+            # direction, or a variant that is not cached. Omitting it is right;
+            # inventing a trip is what produced nonsense arrivals.
+            return None
+        pool = heading_there
 
     dep_offsets: list[tuple[date, int]] = []
     if vehicle.origin_dep is not None:
@@ -183,13 +258,27 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Trip | None:
         ],
         [t for t in pool if dep_delta(t) <= TIER3_TOL],
     )
-    for tier in tiers:
-        if len(tier) == 1:
-            return tier[0]
-        if tier:
-            # Break ties on how close the vehicle sits to each trip's path.
-            return min(tier, key=lambda t: nearest_on_trip(t, vehicle.lat, vehicle.lon)[1])
+    for level, tier in enumerate(tiers, start=1):
+        if not tier:
+            continue
+        # Break ties on departure time first, position only to settle a draw.
+        #
+        # Distance alone is worthless here. Every trip on a route follows the
+        # same road, so on a frequent corridor like the 192 the whole candidate
+        # set sits within metres of the vehicle and the "closest path" is
+        # arbitrary. Choosing that way produced delays of 20 to 45 minutes on
+        # buses that were running to time.
+        best = min(
+            tier,
+            key=lambda t: (dep_delta(t), nearest_on_trip(t, vehicle.lat, vehicle.lon)[1]),
+        )
+        return Match(best, level, dep_delta(best))
 
-    # Last resort: the trip whose path passes closest, but only if plausibly close.
+    # Nothing to go on but geometry, which happens when the feed omits
+    # OriginAimedDepartureTime. Good enough to place the vehicle on the route
+    # and estimate an arrival; not good enough to name the run, so the caller
+    # is told not to trust the schedule comparison.
     best = min(pool, key=lambda t: nearest_on_trip(t, vehicle.lat, vehicle.lon)[1])
-    return best if nearest_on_trip(best, vehicle.lat, vehicle.lon)[1] < 250 else None
+    if nearest_on_trip(best, vehicle.lat, vehicle.lon)[1] >= 250:
+        return None
+    return Match(best, 4, float("inf"))

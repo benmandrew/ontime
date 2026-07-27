@@ -19,6 +19,9 @@ from .siri import Vehicle
 
 DEFAULT_SEGMENT_SECS = 60.0
 
+# Beyond this, a reported delay says more about the match than the bus.
+MAX_PLAUSIBLE_DELAY_SECS = 90 * 60
+
 
 @dataclass
 class Prediction:
@@ -55,8 +58,15 @@ def predict(
     target_stop_id: str,
     segments: dict,
     now: float | None = None,
+    schedule_confident: bool = True,
 ) -> Prediction | None:
-    """Predict this vehicle's arrival at one stop, or None if it has passed."""
+    """Predict this vehicle's arrival at one stop, or None if it has passed.
+
+    `schedule_confident` says whether the matcher pinned down which run this
+    is. When it did not, the arrival estimate still holds — every trip on a
+    route walks the same stops — but the scheduled time would come from an
+    arbitrary run, so no delay is reported rather than a fictional one.
+    """
     now = now or datetime.now(UTC).timestamp()
 
     target_idx = next((i for i, s in enumerate(trip.stops) if s[1] == target_stop_id), None)
@@ -108,6 +118,13 @@ def predict(
     eta_ts = now + total
     sched_ts = sched_timestamp(trip, trip.stops[target_idx][2])
 
+    delay = (eta_ts - sched_ts) if (sched_ts and schedule_confident) else None
+    # A delay past this is not a late bus, it is a mismatched trip. Report the
+    # arrival, which is derived from position and holds regardless, and drop
+    # the schedule comparison that does not.
+    if delay is not None and abs(delay) > MAX_PLAUSIBLE_DELAY_SECS:
+        delay = None
+
     return Prediction(
         stop_id=target_stop_id,
         route_name=trip.route_name,
@@ -118,7 +135,7 @@ def predict(
         minutes=total / 60,
         source="learned" if learned_n and learned_n >= total_n / 2 else "timetable",
         learned_coverage=(learned_n / total_n) if total_n else 1.0,
-        delay_secs=(eta_ts - sched_ts) if sched_ts else None,
+        delay_secs=delay,
         lat=vehicle.lat,
         lon=vehicle.lon,
         bearing=vehicle.bearing,
