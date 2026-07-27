@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import shutil
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
@@ -84,6 +84,62 @@ class TestCacheIsCurrent:
         fresh cache and must not rebuild, nor skip a genuinely stale one."""
         monkeypatch.setattr(maintenance.time, "monotonic", lambda: 0.0)
         assert maintenance.cache_is_current() is True
+
+
+class TestBuildStampIsAServiceDate:
+    """`build` writes the stamp; `cache_is_current` reads it. Both must mean
+    the same date.
+
+    The containers run on UTC and every date decision in the project is
+    London's, which through BST disagree for the hour after midnight. A stamp
+    written from the container's date was a day behind for that hour, so the
+    comparison below could not be satisfied and the loop rebuilt the timetable
+    on every tick until UTC caught up — a minute-long write lock taken roughly
+    every two minutes against the volume the board polls.
+    """
+
+    # 00:30 in London, still 23:30 on the 27th in UTC.
+    AFTER_MIDNIGHT = datetime(2026, 7, 28, 0, 30, tzinfo=LONDON)
+
+    @pytest.fixture
+    def after_midnight(self, monkeypatch):
+        instant = self.AFTER_MIDNIGHT
+
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return instant.astimezone(UTC).replace(tzinfo=None)
+                return instant.astimezone(tz)
+
+        class FrozenDate(date):
+            @classmethod
+            def today(cls):
+                return instant.astimezone(UTC).date()
+
+        monkeypatch.setattr(ingest, "datetime", Frozen)
+        monkeypatch.setattr(maintenance, "datetime", Frozen)
+        # The container's own clock, frozen to the same instant. Without this
+        # the test passes against the bug on any machine whose local date
+        # already agrees with London's, which is most of them most of the time.
+        monkeypatch.setattr(ingest, "date", FrozenDate, raising=False)
+
+    def test_the_stamp_is_the_london_date(self, data_dir, after_midnight):
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+
+        conn = db.connect()
+        row = conn.execute("SELECT value FROM meta WHERE key='built_at'").fetchone()
+        conn.close()
+        assert row["value"] == "2026-07-28", "UTC was still on the 27th"
+
+    def test_a_cache_is_current_the_moment_it_is_built(self, data_dir, after_midnight):
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+
+        assert maintenance.cache_is_current() is True, (
+            "a rebuild that does not satisfy the staleness check loops forever"
+        )
 
 
 class TestMainLoop:

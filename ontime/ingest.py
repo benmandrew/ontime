@@ -17,11 +17,12 @@ import sys
 import time
 import zipfile
 from collections.abc import Iterator
-from datetime import date
+from datetime import datetime
 
 import requests
 
 from . import config, db, locking, logs
+from .matching import LONDON
 
 log = logs.get("ontime.ingest")
 
@@ -249,8 +250,14 @@ def _build() -> None:
         cur.executemany("INSERT OR REPLACE INTO target_calls VALUES (?,?,?,?)", calls)
         log.info("%d scheduled calls at the watched stops", len(calls))
 
+    # The service date, not the container's. Everything that reads this stamp
+    # compares it against Europe/London, and the containers run on UTC, so
+    # `date.today()` disagreed for the hour after midnight through BST — long
+    # enough for the maintenance loop to decide the cache was stale on every
+    # tick and rebuild it around twenty-five times before UTC caught up.
     cur.execute(
-        "INSERT OR REPLACE INTO meta VALUES ('built_at', ?)", (date.today().isoformat(),)
+        "INSERT OR REPLACE INTO meta VALUES ('built_at', ?)",
+        (datetime.now(LONDON).date().isoformat(),),
     )
     conn.commit()
     conn.close()
