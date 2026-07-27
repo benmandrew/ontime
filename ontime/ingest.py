@@ -21,7 +21,7 @@ from datetime import date
 
 import requests
 
-from . import config, db, logs
+from . import config, db, locking, logs
 
 log = logs.get("ontime.ingest")
 
@@ -79,7 +79,35 @@ def rows(zf: zipfile.ZipFile, name: str) -> Iterator[dict[str, str]]:
         yield from csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig"))
 
 
-def build() -> None:
+def build(force: bool = False) -> None:
+    """Rebuild the timetable cache.
+
+    Refuses to start if another process is already writing this database.
+    Concurrency is safe on an ordinary filesystem, but a host process and a
+    bind-mounted container sharing the directory will SIGBUS on the mmap'd
+    write-ahead `-shm` file — a silent kill with nothing to catch. Callers that
+    know their topology is safe, such as the maintenance container, pass
+    `force=True`.
+    """
+    if not force:
+        others = locking.other_writers(exclude="ingest")
+        if others:
+            raise SystemExit(
+                "Refusing to rebuild: another ontime process is writing "
+                f"{config.DB_PATH}\n  " + "\n  ".join(str(w) for w in others) + "\n"
+                "Stop it first. If it is a container bind-mounting this directory, "
+                "that combination can kill this process with SIGBUS rather than an "
+                f"error. A writer killed uncleanly ages out after "
+                f"{locking.STALE_AFTER_SECS}s. Pass --force to override."
+            )
+    locking.heartbeat("ingest")
+    try:
+        _build()
+    finally:
+        locking.release("ingest")
+
+
+def _build() -> None:
     conn = db.connect()
     db.init(conn)
     cur = conn.cursor()
@@ -233,7 +261,7 @@ def main() -> None:
     force = "--force" in sys.argv
     log.info("building timetable cache")
     download(force=force)
-    build()
+    build(force=force)
     log.info("done, cache at %s", config.DB_PATH)
 
 

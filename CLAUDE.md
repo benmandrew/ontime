@@ -21,7 +21,7 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
    match SIRI `DatedVehicleJourneyRef` (`6053`). Service 50 matched 0/16. The BODS
    TransXChange→GTFS converter regenerates the code. Match on
    (route, origin_ref, dest_ref, origin_aimed_departure_time) instead — see
-   `ontime/matching.py`, three tiers with a position tiebreak.
+   `ontime/matching.py`, three tiers tied on departure time (see 14).
 3. **The feed is full of stale ghosts.** Vehicles persist for hours after their journey
    ends because operators do not signal completion. Records observed 8+ hours old
    alongside fresh ones. Always filter on `RecordedAtTime` (`ONTIME_STALE_SECS`).
@@ -51,14 +51,30 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     what survived. `ALPINE_VERSION` in the Dockerfile must match whatever alpine
     `python:3.12-alpine` is built on, or musl mismatches.
 12. **Never bind-mount the data dir on macOS.** Concurrent SQLite access over a
-    Docker Desktop bind mount SIGBUSes. Compose uses a named volume; verified safe
-    with the web container polling while ingest rebuilds.
+    Docker Desktop bind mount SIGBUSes — WAL mmaps the `-shm` file and two kernels
+    mapping it through VirtioFS is fatal. Compose uses a named volume; verified safe
+    with the web container polling while ingest rebuilds. `ingest` now refuses to
+    start when another writer's heartbeat is fresh (`ontime/locking.py`), because a
+    SIGBUS cannot be caught and the crash is otherwise unexplainable.
+13. **Filter by direction before matching.** A watched stop served one way caches
+    only that direction: all 467 cached 192 trips run towards Manchester. 23 of 37
+    live 192s head to Stockport, and a time-only match assigned them to northbound
+    runs — the source of "362 minutes early" on the board. Require `DestinationRef`
+    to appear *after* the vehicle's position; terminus ATCO codes are shared between
+    directions so comparing termini alone is not enough.
+14. **Never break a match tie on distance.** Every trip on a route follows one road,
+    so the whole candidate set sits within metres and "closest path" is arbitrary.
+    Tie on departure time. Distance-based ties produced 20-45 minute phantom delays.
+15. **Do not claim a delay that is not known.** A geometry-only match cannot identify
+    the run, so `schedule_confident` is False and the delay is withheld; the arrival
+    is positional and still holds. Delays past 90 minutes are suppressed as
+    mismatches rather than displayed.
 
 ## Measured baselines (Apple silicon, real data)
 
-Ingest 17s · cache 8.9MB · match 1.41ms/vehicle · duty cycle <3% at a 15s poll ·
-RSS 60MB · history ~8MB/day. Docker image 62.4MB (19.6MB gzipped; was 220MB), non-root,
-no pip/fastapi/pydantic. `nix develop` ~10s. 113 tests in ~2s.
+Ingest 17s · cache 8.9MB · match 0.32ms/vehicle · duty cycle <3% at a 15s poll ·
+RSS 64MB · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured, not extrapolated). Docker image 62.4MB (19.6MB gzipped; was 220MB), non-root,
+no pip/fastapi/pydantic. `nix develop` ~10s. 137 tests in ~2s.
 
 ## Constraints
 

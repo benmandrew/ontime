@@ -27,7 +27,11 @@ LEARN_INTERVAL = 3600
 def run_ingest() -> None:
     log.info("refreshing timetable")
     ingest.download()
-    ingest.build()
+    # force=True: this container shares a named volume with the web container
+    # by design, and rebuilding while it polls was verified safe. The guard in
+    # build() exists for a host process racing a bind-mounted container, which
+    # is a different and genuinely unsafe situation.
+    ingest.build(force=True)
 
 
 def run_learn() -> None:

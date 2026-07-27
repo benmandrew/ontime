@@ -17,7 +17,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from . import config, db, eta, history, logs, siri
+from . import config, db, eta, history, locking, logs, siri
 from .matching import LONDON, Trip, load_trips, match
 
 STATIC = Path(__file__).parent / "static"
@@ -157,6 +157,7 @@ def poll_once() -> dict:
     `asyncio.to_thread` does not guarantee the same worker each time.
     Connecting is cheap next to fetching and parsing the feed.
     """
+    locking.heartbeat("poller")
     conn = db.connect()
     try:
         db.init(conn)
@@ -197,6 +198,9 @@ async def lifespan(_app: Starlette):
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+        # Drop the heartbeat on the way out so a rebuild started straight after
+        # a clean shutdown does not have to wait for it to age out.
+        locking.release("poller")
 
 
 async def api_board(_request: Request) -> JSONResponse:

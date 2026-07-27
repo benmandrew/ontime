@@ -26,6 +26,11 @@
 - [x] Image 220MB to 62.4MB: alpine base, fastapi dropped for starlette, pruning
       moved into the builder so deletions actually reclaim space
 
+- [x] Guard against a second writer (`ontime/locking.py`) after a host ingest
+      SIGBUSed against a leftover bind-mounted container
+- [x] Direction filter: wrong-way buses were being matched and shown, producing
+      delays up to 362 minutes. Live delay spread now -1 to +7 min, all tier 1
+
 ## In progress
 
 - [ ] Nothing. Waiting on history to accumulate.

@@ -20,7 +20,11 @@ The feed therefore answers *where is the bus* and never *when will it reach my s
 
 ## How prediction works
 
-**Match.** Each live vehicle is tied to a timetabled trip. The obvious key does not work: BODS ships a `vehicle_journey_code` in its converted GTFS and a `DatedVehicleJourneyRef` in SIRI-VM, and the converter regenerates the former rather than preserving the operator's. Measured against the services calling at these stops, service 50 matched 0 of 16 live vehicles. What survives conversion is the shape of the journey, so matching keys on origin stop, destination stop and aimed departure time, loosening through three tiers until something fits.
+**Filter by direction.** A route's two directions are separate trips, and only one direction is cached when a watched stop is served one way: all 467 cached trips for the 192 run towards Manchester, because MANADTDW is the northwest-bound stop. Twenty-three of thirty-seven live 192s were heading to Stockport. A vehicle is kept only when its `DestinationRef` appears *after* its current position in the candidate trip. Comparing terminus identifiers alone is not enough, because a terminus often shares one ATCO code between directions — Hazel Grove Park and Ride does.
+
+**Match.** Each surviving vehicle is tied to a timetabled trip. The obvious key does not work: BODS ships a `vehicle_journey_code` in its converted GTFS and a `DatedVehicleJourneyRef` in SIRI-VM, and the converter regenerates the former rather than preserving the operator's. Measured against the services calling at these stops, service 50 matched 0 of 16 live vehicles. What survives conversion is the shape of the journey, so matching keys on origin stop, destination stop and aimed departure time, loosening through three tiers until something fits. Ties break on departure time, never on distance: every trip on a route follows one road, so on a frequent corridor the whole candidate set sits within metres of the vehicle and the closest path is arbitrary.
+
+**Say only what is known.** A match that rests on geometry alone places the vehicle on the route but does not identify which run it is on. The arrival still holds, because every trip walks the same stops, but the scheduled time would come from an arbitrary run, so no delay is reported rather than a fabricated one. A delay beyond 90 minutes is treated the same way: that is a mismatched trip, not a late bus.
 
 **Locate.** The closest stop in the matched trip's sequence gives the vehicle's progress, and its distance along the current leg prorates the partial segment.
 
@@ -76,14 +80,16 @@ Measured on Apple silicon against the real feed and the full North West archive,
 |---|---|
 | Timetable ingest | 17 s, from an 89MB archive with a 398MB `stop_times.txt` |
 | Cache on disk | 8.9 MB for 1,135 trips and 54,131 stop times |
-| Vehicle-to-trip matching | 1.41 ms per vehicle, 19 of 20 matched |
-| Whole poll cycle at 40 vehicles | about 300 ms, of which 240 ms is waiting on the network |
+| Vehicle-to-trip matching | 0.32 ms per vehicle over 61 live vehicles |
+| Whole poll cycle at 60 vehicles | about 430 ms, of which 400 ms is waiting on the network |
 | Duty cycle at a 15-second poll | under 3% |
 | Resident memory | 60 MB |
-| Position history | roughly 8 MB a day, 165 MB at the 21-day retention |
+| Position history | 6,018 rows a day at 95 bytes, so 0.6 MB a day and 12 MB at the 21-day retention |
 | Container image | 62.4 MB uncompressed, 19.6 MB transferred |
 
-Matching is cheap because the first tier — origin stop, destination stop and aimed departure time — almost always hits, so the geometric fallback that walks every candidate path rarely runs.
+Matching is cheap because the direction filter runs first and cuts the candidate pool hard, after which origin, destination and aimed departure time identify the run uniquely: every match in a live sample landed in the first tier. Adding that filter made matching four times faster than the version without it, not slower, because the expensive positional work now runs against a fraction of the candidates. The destination check itself resolves the vehicle's position once per vehicle rather than once per candidate, which turns a haversine over every candidate's every stop into two dictionary lookups.
+
+Storage is measured rather than extrapolated. Assuming every vehicle visible now reports all day overstates it by more than an order of magnitude, because the feed repeats a vehicle's `RecordedAtTime` between updates and those duplicates are dropped on insert.
 
 Indices are deliberately sparse. Each was checked with `EXPLAIN QUERY PLAN` against a real cache, and four that no query reached were removed: one unused index on `observations` alone cost 45% more insert time, 430 ms against 297 ms per 200,000 rows, and inserting is the hot path. The remaining full-table scans are intentional, either because the caller wants every row or because the table holds a few hundred of them.
 
