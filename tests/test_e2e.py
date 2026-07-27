@@ -244,6 +244,55 @@ class TestHttpApi:
         assert api_key not in health.text
 
 
+class TestColdStart:
+    """The web process comes up beside the ingest, not after it.
+
+    On a cold volume the first ingest takes around 90 seconds, so the first
+    polls read a database with no trips in it. Caching that empty result for
+    the day is indistinguishable on the board from a genuinely quiet evening.
+    """
+
+    def test_an_empty_timetable_is_not_cached_for_the_day(
+        self, data_dir, feed, api_key, monkeypatch
+    ):
+        monkeypatch.setattr(web, "state", web.State())
+        conn = db.connect()
+        db.init(conn)
+
+        web.refresh_timetable(conn)
+        assert web.state.trips == []
+        assert web.state.trips_for is None, (
+            "an empty load must leave the next poll to retry"
+        )
+
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+        web.refresh_timetable(conn)
+        conn.close()
+
+        assert web.state.trips
+        assert web.state.trips_for == datetime.now(LONDON).date()
+        assert web.state.routes
+
+    def test_the_board_says_the_timetable_is_missing(
+        self, data_dir, feed, api_key, monkeypatch
+    ):
+        monkeypatch.setattr(web, "state", web.State())
+        with TestClient(web.app) as client:
+            body = client.get("/api/board").json()
+
+        assert body["timetable"] == {"date": None, "trips": 0, "routes": []}
+        assert all(s["departures"] == [] for s in body["stops"])
+
+    def test_the_board_reports_a_loaded_timetable(self, live_app):
+        with TestClient(web.app) as client:
+            body = client.get("/api/board").json()
+
+        assert body["timetable"]["trips"] > 0
+        assert body["timetable"]["date"] == datetime.now(LONDON).date().isoformat()
+        assert body["timetable"]["routes"]
+
+
 class TestResilience:
     def test_poller_survives_a_malformed_response(self, live_app):
         live_app["payload"] = b"<not-xml"

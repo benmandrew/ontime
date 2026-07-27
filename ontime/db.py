@@ -131,6 +131,11 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
         conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # Write-ahead logging keeps readers off the writer's back, but it does not
+    # help two writers, and the daily ingest holds the lock for well over a
+    # minute. Without a timeout SQLite gives up instantly, which is enough to
+    # fail every poll for the duration of the refresh.
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 

@@ -44,6 +44,7 @@
   .empty { padding: .9rem; color: var(--dim); font-size: .85rem; }
   footer { margin-top: 1.1rem; color: var(--dim); font-size: .75rem; }
   .err { background: #7f1d1d; color: #fff; padding: .5rem .8rem; border-radius: 8px; margin-bottom: .8rem; }
+  .warn { background: #78350f; color: #fff; padding: .5rem .8rem; border-radius: 8px; margin-bottom: .8rem; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
 </style>
 </head>
@@ -76,8 +77,14 @@ function delayCell(d) {
 }
 
 function render(data) {
-  document.getElementById('err').innerHTML = data.error
-    ? `<div class="err">${data.error}</div>` : '';
+  // An unloaded timetable and a quiet evening both produce an empty board, so
+  // say which one this is rather than leaving it to be guessed.
+  const tt = data.timetable || {};
+  const noTimetable = !tt.date || !tt.trips;
+  document.getElementById('err').innerHTML =
+    (data.error ? `<div class="err">${data.error}</div>` : '') +
+    (noTimetable ? `<div class="warn">No timetable loaded. The board is empty because
+      the schedule has not been ingested yet, not because nothing is due.</div>` : '');
 
   document.getElementById('grid').innerHTML = data.stops.map(s => `
     <div class="card">
@@ -95,13 +102,16 @@ function render(data) {
             <td>${delayCell(d)}</td>
             <td class="due">${due(d)}</td>
           </tr>`).join('')}</tbody>
-      </table>` : '<div class="empty">Nothing due within the horizon.</div>'}
+      </table>` : `<div class="empty">${noTimetable
+        ? 'No timetable loaded.' : 'Nothing due within the horizon.'}</div>`}
     </div>`).join('');
 
   const c = data.counts || {}, h = data.history || {};
   document.getElementById('meta').textContent =
     `updated ${fmtClock(data.updated)} · ${c.matched}/${c.feed} vehicles matched`;
   document.getElementById('foot').textContent =
+    `Timetable: ${noTimetable ? 'not loaded' :
+      `${tt.trips.toLocaleString()} trips for ${tt.date} across ${tt.routes.length} routes`} · ` +
     `History: ${(h.observations || 0).toLocaleString()} positions over ${h.history_days || 0} days · ` +
     `${(h.stop_events || 0).toLocaleString()} stop events · ${h.learned_segments || 0} learned segments. ` +
     `Green "learned" rows use observed run-times; amber "est" rows fall back to the timetable.`;

@@ -30,6 +30,7 @@ class State:
     def __init__(self) -> None:
         self.trips: list[Trip] = []
         self.trips_for: date | None = None
+        self.warned_empty_for: date | None = None
         self.segments: dict = {}
         self.board: dict = {"stops": [], "updated": None, "error": None}
         self.vehicles: list = []
@@ -41,12 +42,28 @@ state = State()
 
 
 def refresh_timetable(conn) -> None:
-    """Reload the day's trips when the service date rolls over."""
+    """Reload the day's trips when the service date rolls over.
+
+    An empty load is deliberately not cached. This process and the
+    maintenance one start together, and against a cold volume the first
+    ingest takes around 90 seconds, so the first few calls here read a
+    database that has no trips in it yet. Stamping the date regardless would
+    pin that empty list until the date next rolled over, and the failure is
+    a quiet one: every stop reports nothing due, no vehicle in the feed ever
+    matches a trip, and both look exactly like a genuinely quiet evening.
+    """
     today = datetime.now(LONDON).date()
     if state.trips_for == today:
         return
     days = (today, today - timedelta(days=1))
-    state.trips = load_trips(conn, days)
+    trips = load_trips(conn, days)
+    if not trips:
+        # Every poll retries, so warn once a day rather than every 15s.
+        if state.warned_empty_for != today:
+            state.warned_empty_for = today
+            log.warning("no timetable cached for %s yet, retrying", today)
+        return
+    state.trips = trips
     state.trips_for = today
     state.routes = {t.route_name for t in state.trips}
     log.info(
@@ -144,6 +161,13 @@ def build_board(conn) -> dict:
         "vehicles": live_vehicles,
         "updated": now,
         "counts": {"feed": len(vehicles), "matched": len(live_vehicles)},
+        # Without this the page cannot tell a quiet evening from a timetable
+        # that never loaded: both render as an empty board at every stop.
+        "timetable": {
+            "date": state.trips_for.isoformat() if state.trips_for else None,
+            "trips": len(state.trips),
+            "routes": sorted(state.routes),
+        },
         "history": history.stats_summary(conn),
         "error": None,
     }
