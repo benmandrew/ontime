@@ -10,11 +10,12 @@ sequence than it should be.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from . import config
-from .matching import LONDON, Trip, haversine, nearest_on_trip
+from .matching import LONDON, Trip, nearest_on_trip, service_midnight
 from .siri import Vehicle
 
 DEFAULT_SEGMENT_SECS = 60.0
@@ -42,14 +43,39 @@ class Prediction:
     extra: dict = field(default_factory=dict)
 
 
-def _service_midnight(day) -> float:
-    return datetime(day.year, day.month, day.day, tzinfo=LONDON).timestamp()
-
-
 def sched_timestamp(trip: Trip, arr_secs: int | None) -> float | None:
+    """Wall-clock instant of a timetabled time on this trip's service day.
+
+    The anchor is the GTFS service midnight — noon minus twelve hours — and not
+    local midnight; see `matching.service_midnight` for what the difference
+    costs on the two clock-change Sundays.
+    """
     if arr_secs is None:
         return None
-    return _service_midnight(trip.service_date) + arr_secs
+    return service_midnight(trip.service_date) + arr_secs
+
+
+def _fraction_along(
+    alat: float, alon: float, blat: float, blon: float, lat: float, lon: float
+) -> float:
+    """How far along the a-to-b leg a vehicle has actually got, 0 to 1.
+
+    `nearest_on_trip` returns an undirected straight-line distance to the
+    closest stop, which says nothing about which side of it the vehicle is on.
+    Treating that distance as progress charged a bus still *approaching* stop a
+    as though it were that far past it, and into the wrong segment: walking a
+    vehicle up a 197m leg gave 3.68, 3.84 then 4.00 minutes, an ETA rising as
+    the bus closed on its target. Projecting onto the leg gives the sign the
+    distance lacks, so a bus short of stop a is credited nothing. Plane
+    geometry is exact enough over the few hundred metres a leg spans.
+    """
+    kx = math.cos(math.radians(alat))
+    dx, dy = (blon - alon) * kx, blat - alat
+    d2 = dx * dx + dy * dy
+    if d2 <= 0:
+        return 0.0
+    vx, vy = (lon - alon) * kx, lat - alat
+    return min(max((vx * dx + vy * dy) / d2, 0.0), 1.0)
 
 
 def predict(
@@ -73,7 +99,7 @@ def predict(
     if target_idx is None:
         return None
 
-    pos_idx, pos_dist, _seq = nearest_on_trip(trip, vehicle.lat, vehicle.lon)
+    pos_idx, _pos_dist, _seq = nearest_on_trip(trip, vehicle.lat, vehicle.lon)
     if pos_idx > target_idx:
         return None
 
@@ -81,6 +107,7 @@ def predict(
     weekend = int(datetime.fromtimestamp(now, LONDON).weekday() >= 5)
 
     total = 0.0
+    first_secs = 0.0
     learned_n = total_n = 0
     for i in range(pos_idx, target_idx):
         _, from_id, from_arr, _, _ = trip.stops[i]
@@ -89,30 +116,26 @@ def predict(
         key = (trip.route_name, from_id, to_id, hour, weekend)
         hit = segments.get(key)
         if hit:
-            total += hit[0]
+            secs = hit[0]
             learned_n += 1
         elif from_arr is not None and to_arr is not None and to_arr > from_arr:
-            total += to_arr - from_arr
+            secs = float(to_arr - from_arr)
         else:
-            total += DEFAULT_SEGMENT_SECS
+            secs = DEFAULT_SEGMENT_SECS
+        total += secs
+        if i == pos_idx:
+            # Kept so the credit below subtracts the very seconds this segment
+            # contributed. Recomputing it fell back to DEFAULT_SEGMENT_SECS and
+            # credited 24s of a 120s timetabled segment where 48s was due.
+            first_secs = secs
 
-    # The vehicle sits somewhere between pos_idx and the next stop; remove the
-    # portion of that first segment it has already covered.
+    # The vehicle is somewhere on the leg out of pos_idx, or has yet to reach
+    # it; remove only the part of that first segment it has genuinely covered.
     if pos_idx < target_idx:
         _, _, _, alat, alon = trip.stops[pos_idx]
         _, _, _, blat, blon = trip.stops[pos_idx + 1]
-        leg = haversine(alat, alon, blat, blon)
-        if leg > 1:
-            frac = min(max(pos_dist / leg, 0.0), 1.0)
-            first_key = (
-                trip.route_name,
-                trip.stops[pos_idx][1],
-                trip.stops[pos_idx + 1][1],
-                hour,
-                weekend,
-            )
-            first_secs = segments.get(first_key, (DEFAULT_SEGMENT_SECS,))[0]
-            total -= frac * first_secs
+        frac = _fraction_along(alat, alon, blat, blon, vehicle.lat, vehicle.lon)
+        total -= frac * first_secs
 
     total = max(total, 0.0)
     eta_ts = now + total

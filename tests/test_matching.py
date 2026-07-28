@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
 from ontime import siri
 from ontime.matching import (
     LONDON,
+    MAX_OFF_ROUTE_M,
     haversine,
     load_trips,
     match,
     nearest_on_trip,
     service_day_offsets,
+    service_midnight,
 )
 
 from .conftest import (
@@ -25,6 +28,45 @@ from .conftest import (
     vehicle_on_trip,
     vehicle_xml,
 )
+
+
+def opposite_direction(trip):
+    """The other direction of a real trip, shaped the way the real cache is.
+
+    The cut-down archive holds one direction per route, because that is what the
+    watched stops are served by; production caches both whenever two watched
+    stops sit on opposite directions of one route. The shape that matters here
+    is taken from the real data: the two termini share an ATCO code between
+    directions — Hazel Grove Park and Ride does — while every intermediate stop
+    carries the across-the-road code, which appears on no forward trip.
+    """
+    reversed_geometry = list(reversed(trip.stops))
+    stops = []
+    for i, (forward, back) in enumerate(zip(trip.stops, reversed_geometry, strict=True)):
+        terminus = i in (0, len(trip.stops) - 1)
+        stop_id = back[1] if terminus else back[1][:-1] + "2"
+        stops.append((forward[0], stop_id, forward[2], back[3], back[4]))
+    return replace(
+        trip,
+        trip_id=f"{trip.trip_id}-reverse",
+        origin_stop_id=stops[0][1],
+        dest_stop_id=stops[-1][1],
+        stops=stops,
+    )
+
+
+def vehicle_at(trip, lat: float, lon: float) -> str:
+    """A vehicle carrying this trip's refs exactly, but positioned by hand."""
+    away = datetime.fromtimestamp(service_midnight(trip.service_date) + trip.first_dep, UTC)
+    return vehicle_xml(
+        line=trip.route_name,
+        origin_ref=trip.origin_stop_id,
+        dest_ref=trip.dest_stop_id,
+        origin_dep=away,
+        recorded_at=datetime.now(UTC),
+        lat=lat,
+        lon=lon,
+    )
 
 
 class TestHaversine:
@@ -65,6 +107,118 @@ class TestServiceDay:
         day, secs = service_day_offsets(utc_noon)[0]
         assert secs == 12 * 3600
         assert day.isoformat() == "2026-07-15"
+
+
+class TestClockChanges:
+    """The two Sundays a year when the local day is not twenty-four hours long.
+
+    GTFS anchors a service day on noon minus twelve hours rather than local
+    midnight, and the clock changes are the whole reason for the definition:
+    one calendar row in the real cache covers both 2026-10-18 and 2026-10-25
+    with 245 trips at identical times, which only works if the anchor moves
+    with the clocks. Anchoring on local midnight reported every bus exactly 60
+    minutes late for the whole of clocks-back Sunday and 60 early on
+    clocks-forward Sunday — under MAX_PLAUSIBLE_DELAY_SECS, so the suppression
+    that catches mismatched trips never saw it.
+    """
+
+    CLOCKS_BACK = date(2026, 10, 25)  # 02:00 BST becomes 01:00 GMT
+    CLOCKS_FORWARD = date(2026, 3, 29)  # 01:00 GMT becomes 02:00 BST
+    NORMAL = date(2026, 10, 18)  # the Sunday before, on the same calendar row
+
+    @staticmethod
+    def local_midnight(day: date) -> float:
+        return datetime(day.year, day.month, day.day, tzinfo=LONDON).timestamp()
+
+    def test_anchor_is_noon_minus_twelve_hours(self):
+        assert (
+            service_midnight(self.CLOCKS_BACK)
+            == datetime(2026, 10, 25, 0, 0, tzinfo=UTC).timestamp()
+        )
+        assert (
+            service_midnight(self.CLOCKS_FORWARD)
+            == datetime(2026, 3, 28, 23, 0, tzinfo=UTC).timestamp()
+        )
+        assert (
+            service_midnight(self.NORMAL)
+            == datetime(2026, 10, 17, 23, 0, tzinfo=UTC).timestamp()
+        )
+
+    def test_local_midnight_is_an_hour_out_on_the_transition_days(self):
+        """The hour the old anchor lost, and the 363 days it got away with it."""
+        assert service_midnight(self.CLOCKS_BACK) - self.local_midnight(
+            self.CLOCKS_BACK
+        ) == pytest.approx(3600)
+        assert service_midnight(self.CLOCKS_FORWARD) - self.local_midnight(
+            self.CLOCKS_FORWARD
+        ) == pytest.approx(-3600)
+        assert service_midnight(self.NORMAL) == pytest.approx(
+            self.local_midnight(self.NORMAL)
+        )
+
+    def test_previous_service_day_is_measured_from_its_own_anchor(self):
+        """A flat +86400 loses the hour the clocks give back overnight.
+
+        Adding a constant day to the wall clock put 02:30 on clocks-back Sunday
+        at 26:30 of Saturday's service day, when the timetable calls it 27:30.
+        The cache holds 44 calls running out to 27:30 and these corridors run
+        every 15 to 30 minutes at night, so a real trip an hour off was always
+        there to absorb the error: it scored dep_delta 0 and won at tier 1,
+        turning a delay that should have been withheld into a confident
+        60-minute phantom.
+        """
+        back = service_day_offsets(datetime(2026, 10, 25, 2, 30, tzinfo=UTC))
+        assert back[1] == (date(2026, 10, 24), 27 * 3600 + 30 * 60)
+
+        # The mirror image: clocks-forward Sunday swallows an hour, so 03:30 BST
+        # is 26:30 of Saturday and not the 27:30 a flat day would make of it.
+        forward = service_day_offsets(datetime(2026, 3, 29, 2, 30, tzinfo=UTC))
+        assert forward[1] == (date(2026, 3, 28), 26 * 3600 + 30 * 60)
+
+        # Every other night really is a day long, and must stay that way.
+        plain = service_day_offsets(datetime(2026, 7, 15, 1, 30, tzinfo=UTC))
+        assert plain[1] == (date(2026, 7, 14), 26 * 3600 + 30 * 60)
+
+    def test_same_service_day_still_tracks_the_wall_clock(self):
+        """The offset that was already right is not to be disturbed."""
+        cases = [
+            (datetime(2026, 10, 25, 2, 30, tzinfo=UTC), 2 * 3600 + 30 * 60),
+            (datetime(2026, 3, 29, 2, 30, tzinfo=UTC), 3 * 3600 + 30 * 60),
+            (datetime(2026, 7, 15, 11, 0, tzinfo=UTC), 12 * 3600),
+        ]
+        for when, expected in cases:
+            assert service_day_offsets(when)[0][1] == expected
+
+    def test_post_midnight_vehicle_matches_the_run_it_is_actually_on(self, built_db):
+        """The wrong-run consequence of the flat day, reproduced at tier 1.
+
+        Two real trips a clock hour apart, both departing after midnight the way
+        44 cached calls do, and a vehicle away at 27:30 reporting from 02:30 GMT
+        on clocks-back Sunday. The flat +86400 read it as 26:30 and handed it
+        the earlier run with dep_delta 0.
+        """
+        day = date(2026, 10, 24)
+        base = load_trip(built_db, any_trip_serving(built_db, STOP_192), day)
+        early = replace(base, trip_id="dep-2630", first_dep=26 * 3600 + 30 * 60)
+        late = replace(base, trip_id="dep-2730", first_dep=27 * 3600 + 30 * 60)
+
+        away = datetime.fromtimestamp(service_midnight(day) + late.first_dep, UTC)
+        assert away == datetime(2026, 10, 25, 2, 30, tzinfo=UTC)
+        xml = vehicle_xml(
+            line=base.route_name,
+            origin_ref=base.origin_stop_id,
+            dest_ref=base.dest_stop_id,
+            origin_dep=away,
+            recorded_at=away,
+            lat=base.stops[2][3],
+            lon=base.stops[2][4],
+        )
+
+        got = match(siri.parse(siri_document([xml]))[0], [early, late])
+        assert got is not None
+        assert got.trip.trip_id == "dep-2730", "the flat day picked the run an hour early"
+        assert got.tier == 1
+        assert got.dep_delta == 0
 
 
 class TestLoadTrips:
@@ -214,6 +368,39 @@ class TestDirectionGate:
         got = match(vehicle, load_trips(built_db, (today,)))
         assert got is not None and got.trip.trip_id == trip.trip_id
 
+    def test_the_right_trip_survives_whatever_order_candidates_arrive_in(self, built_db):
+        """The direction filter must not borrow one candidate's stop ids.
+
+        Opposite-direction trips reach the candidate set for exactly the reason
+        this gate exists — the termini share a code. Resolving the vehicle's
+        position once, on whichever trip happened to sort first, meant a reverse
+        trip's across-the-road stop id was looked up in every forward trip,
+        found in none of them, and the correct match was thrown away. Whether
+        the board showed the bus came down to list order.
+        """
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        reverse = opposite_direction(trip)
+        vehicle = siri.parse(siri_document([vehicle_on_trip(trip, 2)]))[0]
+        trips = load_trips(built_db, (today,))
+
+        for candidates in ([reverse, *trips], [*trips, reverse]):
+            got = match(vehicle, candidates)
+            assert got is not None
+            assert got.trip.trip_id == trip.trip_id
+            assert got.tier == 1
+
+    def test_the_opposite_direction_is_still_rejected_on_its_own(self, built_db):
+        """Order independence must not cost the guarantee it came from.
+
+        The reverse trip shares its terminus code with the forward one, so the
+        destination alone cannot separate them. It is rejected because the
+        destination sits behind the vehicle, not in front of it.
+        """
+        trip = self._trip(built_db)
+        vehicle = siri.parse(siri_document([vehicle_on_trip(trip, 2)]))[0]
+        assert match(vehicle, [opposite_direction(trip)]) is None
+
     def test_intermediate_destination_is_accepted(self, built_db):
         """A short working terminating part-way is still coming towards us."""
         today = datetime.now(LONDON).date()
@@ -225,6 +412,70 @@ class TestDirectionGate:
         )
         vehicle = siri.parse(siri_document([xml]))[0]
         assert match(vehicle, load_trips(built_db, (today,))) is not None
+
+
+class TestGeometricSanity:
+    """Matching refs are not proof the vehicle is running the trip.
+
+    Operators keep broadcasting a finished journey's origin, destination and
+    aimed departure while the bus drives back to the depot, and the
+    RecordedAtTime stays fresh, so the staleness filter never sees it — the
+    live-timestamped form of the ghost problem. Those refs matched at tier 1
+    from twelve kilometres off the corridor, with schedule_confident set, and
+    the board grew a departure 54 minutes and 45 stops away that was never
+    going to happen.
+    """
+
+    def _trip(self, conn):
+        return load_trip(
+            conn, any_trip_serving(conn, STOP_192), datetime.now(LONDON).date()
+        )
+
+    def test_off_corridor_vehicle_is_rejected_despite_perfect_refs(self, built_db):
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        # Twelve kilometres east of the origin. Its nearest stop is still the
+        # origin, so the destination is downstream and the direction gate lets
+        # it through: geometry is the only thing left that can reject it.
+        stray = siri.parse(siri_document([vehicle_on_trip(trip, 0, offset_m=12000)]))[0]
+        assert nearest_on_trip(trip, stray.lat, stray.lon)[0] == 0
+        assert nearest_on_trip(trip, stray.lat, stray.lon)[1] > 10_000
+
+        assert match(stray, load_trips(built_db, (today,))) is None
+
+    def test_a_bus_between_two_stops_is_not_rejected(self, built_db):
+        """The bound must never throw off a bus that is exactly where it should be.
+
+        Halfway along the widest gap in the fixture is the furthest from a stop
+        a vehicle on this corridor can legitimately be, and it still has to
+        match, with the schedule confidence its refs earn it.
+        """
+        today = datetime.now(LONDON).date()
+        trip = self._trip(built_db)
+        widest = max(
+            range(len(trip.stops) - 1),
+            key=lambda i: haversine(
+                trip.stops[i][3],
+                trip.stops[i][4],
+                trip.stops[i + 1][3],
+                trip.stops[i + 1][4],
+            ),
+        )
+        lat = (trip.stops[widest][3] + trip.stops[widest + 1][3]) / 2
+        lon = (trip.stops[widest][4] + trip.stops[widest + 1][4]) / 2
+        vehicle = siri.parse(siri_document([vehicle_at(trip, lat, lon)]))[0]
+
+        got = match(vehicle, load_trips(built_db, (today,)))
+        assert got is not None
+        assert got.trip.trip_id == trip.trip_id
+        assert got.schedule_confident
+
+    def test_the_bound_clears_the_widest_real_stop_spacing(self):
+        """1,538m is the longest gap between consecutive stops in the real cache,
+        so a bus stranded halfway along one reads 769m from its nearest stop.
+        A tighter bound would reject buses that are precisely where they belong.
+        """
+        assert MAX_OFF_ROUTE_M > 769
 
 
 class TestMatchConfidence:

@@ -32,6 +32,20 @@ TIER1_TOL = 300
 TIER2_TOL = 300
 TIER3_TOL = 900
 
+# How far from the nearest stop of the matched trip a vehicle may sit and still
+# be believed. The longest gap between consecutive stops anywhere in the real
+# cache is 1,538m, so a bus stranded mid-segment is at most 769m from a stop;
+# add GPS scatter and the offset between the kerbside stop and the road centre
+# and the worst legitimate reading is comfortably under a kilometre. Anything
+# past that is not on this corridor at all — a bus deadheading to the depot
+# still broadcasting its finished journey's refs reads 2,905m out, and its
+# RecordedAtTime is fresh so the staleness filter cannot see it.
+MAX_OFF_ROUTE_M = 1000.0
+
+# Geometry alone has to be far stricter: with no origin, destination or
+# departure time to corroborate it, position is the only evidence there is.
+TIER4_MAX_OFF_ROUTE_M = 250.0
+
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in metres."""
@@ -134,28 +148,72 @@ def load_trips(conn: sqlite3.Connection, days: tuple[date, ...]) -> list[Trip]:
     return out
 
 
+def service_midnight(day: date) -> float:
+    """Unix timestamp the GTFS times of `day` are measured from.
+
+    GTFS defines the service day as noon minus twelve hours, not local
+    midnight, and the distinction is the whole point of the definition: on the
+    two clock-change Sundays the local day is 23 or 25 hours long, so local
+    midnight drifts an hour away from the anchor the published times assume.
+    One calendar row in the real cache covers both 2026-10-18 and 2026-10-25
+    with 245 trips at identical times, which only works if the anchor moves
+    with the clocks.
+
+    Anchoring on local midnight instead put every bus exactly 60 minutes late
+    for the whole of clocks-back Sunday and 60 early on clocks-forward Sunday
+    — inside MAX_PLAUSIBLE_DELAY_SECS, so nothing downstream caught it.
+    """
+    return datetime(day.year, day.month, day.day, 12, tzinfo=LONDON).timestamp() - DAY / 2
+
+
 def service_day_offsets(when: datetime) -> list[tuple[date, int]]:
     """Express an instant as (service_date, seconds-since-service-midnight).
 
     GTFS lets a trip run past midnight with times such as 25:10:00, so an
     instant at 00:30 belongs to both today's service day and yesterday's.
+
+    Both offsets are measured from their own day's anchor rather than by adding
+    a flat 86,400 to the wall clock. Yesterday was 23 or 25 hours long across a
+    clock change, and the flat version put 02:30 on clocks-back Sunday at 26:30
+    of the previous service day when the timetable calls it 27:30. The cache
+    holds 44 calls running out to 27:30, and because these corridors run every
+    15 to 30 minutes at night there is always a real trip an hour off to soak
+    up the error — it scored dep_delta 0 and matched the wrong run at tier 1,
+    turning a withheld delay into a confident 60-minute phantom.
     """
     local = when.astimezone(LONDON)
     today = local.date()
     secs = local.hour * 3600 + local.minute * 60 + local.second
-    out = [(today, secs)]
+    days = [today]
     if secs < 6 * 3600:
-        out.append((today - timedelta(days=1), secs + DAY))
-    return out
+        days.append(today - timedelta(days=1))
+    return [(day, round(when.timestamp() - service_midnight(day))) for day in days]
+
+
+def _nearest(
+    trip: Trip, lat: float, lon: float, seen: dict[str, float]
+) -> tuple[int, float]:
+    """Index and metres to the closest stop, reusing distances already measured.
+
+    Every candidate for a vehicle is a trip on one route, so they walk largely
+    the same stops: 890 cached trips share about six hundred distinct ones. A
+    stop id has a single position, so its distance can be measured once per
+    vehicle and looked up thereafter, which is what keeps the per-candidate
+    direction test affordable.
+    """
+    best_i, best_d = 0, float("inf")
+    for i, (_seq, sid, _arr, slat, slon) in enumerate(trip.stops):
+        d = seen.get(sid)
+        if d is None:
+            d = seen[sid] = haversine(lat, lon, slat, slon)
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i, best_d
 
 
 def nearest_on_trip(trip: Trip, lat: float, lon: float) -> tuple[int, float, int]:
     """Index, distance in metres, and stop sequence of the closest stop."""
-    best_i, best_d = 0, float("inf")
-    for i, (_seq, _sid, _arr, slat, slon) in enumerate(trip.stops):
-        d = haversine(lat, lon, slat, slon)
-        if d < best_d:
-            best_i, best_d = i, d
+    best_i, best_d = _nearest(trip, lat, lon, {})
     return best_i, best_d, trip.stops[best_i][0]
 
 
@@ -179,8 +237,10 @@ class Match:
         return self.tier <= 3 and self.dep_delta <= TIER3_TOL
 
 
-def _dest_is_downstream(trip: Trip, dest_ref: str, anchor_stop_id: str) -> bool:
-    """Whether `dest_ref` lies ahead of `anchor_stop_id` on this trip.
+def _dest_is_downstream(
+    trip: Trip, dest_ref: str, lat: float, lon: float, seen: dict[str, float]
+) -> bool:
+    """Whether `dest_ref` lies ahead of a vehicle at (lat, lon) on this trip.
 
     This is the direction test. A route's two directions are separate trips,
     and only one of them is cached when a watched stop is served in a single
@@ -194,14 +254,20 @@ def _dest_is_downstream(trip: Trip, dest_ref: str, anchor_stop_id: str) -> bool:
     does. Requiring the destination to come *after* the vehicle's position
     separates them properly.
 
-    The anchor is resolved once per vehicle rather than per candidate. Trips on
-    one route follow one corridor, so the nearest stop is the same whichever of
-    them is measured against, and this turns a haversine over every candidate's
-    every stop into two dictionary lookups.
+    The position is resolved against *this* trip, not borrowed from another
+    candidate. Sharing one anchor was cheaper but depended on list order: a
+    trip running the other way reaches `serving` precisely because the termini
+    share a code, and its intermediate stops carry the across-the-road codes,
+    which appear on no forward trip. Whenever such a trip happened to sort
+    first, its anchor was a stop id the forward candidates had never heard of,
+    every one of them looked up None, and the correct match was thrown away.
+    Cached route variants that skip the anchor stop failed the same way.
+    Resolving per candidate costs little once distances are shared — see
+    `_nearest`.
     """
-    here = trip.index_of.get(anchor_stop_id)
+    here = _nearest(trip, lat, lon, seen)[0]
     there = trip.index_of.get(dest_ref)
-    return here is not None and there is not None and there > here
+    return there is not None and there > here
 
 
 def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
@@ -210,14 +276,17 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
     if not pool:
         return None
 
+    # One haversine per distinct stop id, shared by every candidate below.
+    seen: dict[str, float] = {}
+
     if vehicle.dest_ref:
         serving = [t for t in pool if vehicle.dest_ref in t.index_of]
         if not serving:
             return None
-        _pos, _d, _s = nearest_on_trip(serving[0], vehicle.lat, vehicle.lon)
-        anchor = serving[0].stops[_pos][1]
         heading_there = [
-            t for t in serving if _dest_is_downstream(t, vehicle.dest_ref, anchor)
+            t
+            for t in serving
+            if _dest_is_downstream(t, vehicle.dest_ref, vehicle.lat, vehicle.lon, seen)
         ]
         if not heading_there:
             # Going somewhere this timetable does not reach from here: another
@@ -270,15 +339,27 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
         # buses that were running to time.
         best = min(
             tier,
-            key=lambda t: (dep_delta(t), nearest_on_trip(t, vehicle.lat, vehicle.lon)[1]),
+            key=lambda t: (dep_delta(t), _nearest(t, vehicle.lat, vehicle.lon, seen)[1]),
         )
+        # Matching refs are not proof the vehicle is running the trip. Operators
+        # keep broadcasting a finished journey's origin, destination and aimed
+        # departure while the bus drives back to the depot, and those refs match
+        # perfectly at tier 1 from twelve kilometres off the corridor. This is a
+        # sanity bound on the winner, never a way of choosing between candidates
+        # — they all share one road, so distance cannot rank them.
+        if _nearest(best, vehicle.lat, vehicle.lon, seen)[1] > MAX_OFF_ROUTE_M:
+            # Fall through rather than return. A looser tier cannot rescue a bus
+            # that is genuinely elsewhere, but the geometric tier below can still
+            # place one whose refs point at the wrong variant of its own route,
+            # and it will say so by withholding schedule confidence.
+            continue
         return Match(best, level, dep_delta(best))
 
     # Nothing to go on but geometry, which happens when the feed omits
     # OriginAimedDepartureTime. Good enough to place the vehicle on the route
     # and estimate an arrival; not good enough to name the run, so the caller
     # is told not to trust the schedule comparison.
-    best = min(pool, key=lambda t: nearest_on_trip(t, vehicle.lat, vehicle.lon)[1])
-    if nearest_on_trip(best, vehicle.lat, vehicle.lon)[1] >= 250:
+    best = min(pool, key=lambda t: _nearest(t, vehicle.lat, vehicle.lon, seen)[1])
+    if _nearest(best, vehicle.lat, vehicle.lon, seen)[1] >= TIER4_MAX_OFF_ROUTE_M:
         return None
     return Match(best, 4, float("inf"))
