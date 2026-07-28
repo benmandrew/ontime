@@ -145,6 +145,24 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
     return conn
 
 
+# Indices that were dropped from SCHEMA once EXPLAIN QUERY PLAN showed no query
+# reached them. Removing them from the schema was not enough on its own: `init`
+# only ever runs CREATE ... IF NOT EXISTS, so it cannot unmake anything, and
+# every database created before the removal still carried all four — including
+# the long-lived `ontime-data` volume, which is never recreated. The saving was
+# therefore never actually banked anywhere. `obs_trip` is the expensive one:
+# 591ms against 1193ms to insert 200,000 rows, so it was doubling the cost of
+# the hot path — every vehicle, every poll, all day.
+DROPPED_INDICES = (
+    "obs_trip",
+    "trip_stops_stop",
+    "trips_route_dep",
+    "stop_events_stop",
+)
+
+
 def init(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for name in DROPPED_INDICES:
+        conn.execute(f"DROP INDEX IF EXISTS {name}")
     conn.commit()

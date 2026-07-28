@@ -43,8 +43,13 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
    nixpkgs has no darwin cache for it so `nix develop` built it from source and pulled in
    scipy — an hour-plus shell. Starlette gives routing and responses; that is all we use.
 7. **Indices are sparse on purpose.** Four unused ones were removed after checking
-   EXPLAIN QUERY PLAN; one on `observations` cost 45% more insert time for nothing.
-   Inserting is the hot path. Measure with `scripts/benchmark.py` before adding any.
+   EXPLAIN QUERY PLAN; `obs_trip` alone cost 102% more insert time for nothing
+   (591ms against 1193ms for 200,000 rows). Inserting is the hot path. Measure with
+   `scripts/benchmark.py` before adding any. Deleting an index from `db.SCHEMA` does
+   not remove it from any database that already exists — `init` only ever runs
+   CREATE IF NOT EXISTS, so all four survived in the `ontime-data` volume and the
+   saving was never banked. `db.DROPPED_INDICES` drops them by name; add to that
+   tuple whenever you take one out of the schema.
 8. **`derive_stop_events` scans only 26 hours** and is idempotent. Do not widen it to
    the full retention window — that reloads hundreds of thousands of rows hourly to
    rewrite results that cannot have changed. Tests pass `WIDE_LOOKBACK_HOURS`.
