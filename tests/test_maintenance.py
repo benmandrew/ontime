@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
-from ontime import config, db, ingest, maintenance
+from ontime import config, db, ingest, locking, maintenance
 from ontime.matching import LONDON
 
 from .conftest import MINI_GTFS, STOP_192, any_trip_serving, load_trip
@@ -295,3 +295,28 @@ class TestMainLoop:
         out = caplog.text
         assert api_key not in out
         assert "<redacted>" in out
+
+
+class TestLearnAnnouncesItself:
+    """`run_learn` writes for minutes and used to register as nothing.
+
+    A host `python -m ontime.ingest` started during the hourly pass found no
+    writer and proceeded, which is the situation the guard exists to refuse.
+    """
+
+    def test_another_writer_can_see_it_while_it_runs(self, cache, monkeypatch):
+        seen: list = []
+        real = maintenance.history.learn_segments
+
+        def spy(conn):
+            seen.extend(locking.other_writers(exclude="ingest"))
+            return real(conn)
+
+        monkeypatch.setattr(maintenance.history, "learn_segments", spy)
+        maintenance.run_learn()
+
+        assert [w.name for w in seen] == ["learn"]
+
+    def test_the_registration_is_dropped_when_it_finishes(self, cache):
+        maintenance.run_learn()
+        assert locking.other_writers(exclude="ingest") == []

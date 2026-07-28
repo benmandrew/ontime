@@ -6,7 +6,7 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
-from ontime import history
+from ontime import history, locking
 from ontime.matching import LONDON
 
 from .conftest import STOP_192, WIDE_LOOKBACK_HOURS, any_trip_serving, load_trip
@@ -340,3 +340,31 @@ class TestStatsSummary:
         s = history.stats_summary(built_db)
         assert s["observations"] == 10
         assert s["history_days"] > 0
+
+
+class TestBatchJobAnnouncesItself:
+    """`history.main` writes throughout and used to register as nothing.
+
+    It derives events, empties and repopulates segment_stats and trims
+    observations. Run by hand on the host while a container polls the same
+    bind-mounted directory, that is the SIGBUS pairing exactly — and the guard
+    in `ingest.build` saw an idle database.
+    """
+
+    def test_another_writer_can_see_it_while_it_runs(self, built_db, monkeypatch):
+        seen: list = []
+        real = history.learn_segments
+
+        def spy(conn):
+            seen.extend(locking.other_writers(exclude="ingest"))
+            return real(conn)
+
+        monkeypatch.setattr(history, "learn_segments", spy)
+        history.main()
+
+        assert [w.name for w in seen] == ["history"]
+
+    def test_the_registration_is_dropped_when_it_finishes(self, built_db):
+        built_db.close()
+        history.main()
+        assert locking.other_writers(exclude="ingest") == []

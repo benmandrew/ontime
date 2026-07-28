@@ -12,7 +12,7 @@ import time
 import traceback
 from datetime import datetime, timedelta
 
-from . import config, db, history, ingest, logs
+from . import config, db, history, ingest, locking, logs
 from .matching import LONDON, load_trips
 
 log = logs.get("ontime.maint")
@@ -43,22 +43,26 @@ def run_ingest() -> None:
 
 def run_learn() -> None:
     log.info("relearning segments")
-    conn = db.connect()
-    db.init(conn)
-    today = datetime.now(LONDON).date()
-    days = tuple(today - timedelta(days=i) for i in range(config.RETAIN_DAYS + 1))
-    trips = {t.trip_id: t for t in load_trips(conn, days)}
-    events = history.derive_stop_events(conn, trips)
-    segments = history.learn_segments(conn)
-    removed = history.trim(conn, config.RETAIN_DAYS)
-    log.info(
-        "events=%d segments=%d trimmed=%d %s",
-        events,
-        segments,
-        removed,
-        history.stats_summary(conn),
-    )
-    conn.close()
+    # This pass derives events, empties and repopulates segment_stats and trims
+    # observations — minutes of writing that used to announce itself as nothing
+    # at all, so a host ingest started during it saw a clear database.
+    with locking.writing("learn"):
+        conn = db.connect()
+        db.init(conn)
+        today = datetime.now(LONDON).date()
+        days = tuple(today - timedelta(days=i) for i in range(config.RETAIN_DAYS + 1))
+        trips = {t.trip_id: t for t in load_trips(conn, days)}
+        events = history.derive_stop_events(conn, trips)
+        segments = history.learn_segments(conn)
+        removed = history.trim(conn, config.RETAIN_DAYS)
+        log.info(
+            "events=%d segments=%d trimmed=%d %s",
+            events,
+            segments,
+            removed,
+            history.stats_summary(conn),
+        )
+        conn.close()
 
 
 def cache_is_current() -> bool:

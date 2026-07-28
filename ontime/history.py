@@ -19,7 +19,7 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
-from . import config, db, logs
+from . import config, db, locking, logs
 from .matching import LONDON, Trip, haversine, service_day_offsets
 
 log = logs.get("ontime.history")
@@ -275,23 +275,26 @@ def main() -> None:
     logs.setup()
     from .matching import load_trips
 
-    conn = db.connect()
-    db.init(conn)
-    today = datetime.now(LONDON).date()
-    days = tuple(today - timedelta(days=i) for i in range(config.RETAIN_DAYS + 1))
-    trips = {t.trip_id: t for t in load_trips(conn, days)}
+    # Every step below writes, and this is the job most likely to be run by
+    # hand on the host while a container is polling, so it registers too.
+    with locking.writing("history"):
+        conn = db.connect()
+        db.init(conn)
+        today = datetime.now(LONDON).date()
+        days = tuple(today - timedelta(days=i) for i in range(config.RETAIN_DAYS + 1))
+        trips = {t.trip_id: t for t in load_trips(conn, days)}
 
-    events = derive_stop_events(conn, trips)
-    segments = learn_segments(conn)
-    removed = trim(conn, config.RETAIN_DAYS)
-    log.info(
-        "stop events=%d segments=%d trimmed=%d %s",
-        events,
-        segments,
-        removed,
-        stats_summary(conn),
-    )
-    conn.close()
+        events = derive_stop_events(conn, trips)
+        segments = learn_segments(conn)
+        removed = trim(conn, config.RETAIN_DAYS)
+        log.info(
+            "stop events=%d segments=%d trimmed=%d %s",
+            events,
+            segments,
+            removed,
+            stats_summary(conn),
+        )
+        conn.close()
 
 
 if __name__ == "__main__":

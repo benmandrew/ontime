@@ -160,11 +160,11 @@ def build(force: bool = False) -> None:
                 f"error. A writer killed uncleanly ages out after "
                 f"{locking.STALE_AFTER_SECS}s. Pass --force to override."
             )
-    locking.heartbeat("ingest")
-    try:
+    # Held for the whole build, not stamped once at the start: the archive scan
+    # alone runs for over a minute against the real feed, and an unrefreshed
+    # record ages out mid-rebuild.
+    with locking.writing("ingest"):
         _build()
-    finally:
-        locking.release("ingest")
 
 
 @dataclass
