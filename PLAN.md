@@ -31,6 +31,14 @@
 - [x] Direction filter: wrong-way buses were being matched and shown, producing
       delays up to 362 minutes. Live delay spread now -1 to +7 min, all tier 1
 
+- [x] Profiled the hot paths again and acted on all five findings: dropped the four
+      stale indices from existing databases (removing them from the schema had never
+      removed them from the volume), bounded `stop_events` at 90 days so the hourly
+      relearn stops growing, memoised `_nearest` and `dep_delta` inside `match`, gave
+      `scheduled_only` a precomputed watched-stop list, and carried the matched
+      position into `eta.predict`. Rebuild scan 17.29s to 2.16s on a single byte-level
+      pass over `stop_times.txt`, output verified identical table by table.
+
 ## In progress
 
 - [ ] Nothing. Waiting on history to accumulate.

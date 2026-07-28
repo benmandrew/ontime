@@ -140,10 +140,15 @@ in 1MB chunks. 4MB chunks measured no faster and 27MB worse. Cache 7.6MB · duty
 Docker image 62.4MB (19.6MB gzipped; was 220MB), non-root, no pip/fastapi/pydantic.
 `nix develop` ~10s. 208 tests in ~4s.
 
-Matching 1.89ms per *matching* vehicle against the 890-trip pool `web.py` passes. The
-old 0.32ms counted every feed vehicle, most exiting on the route-name filter — not
-comparable, and not a regression. Per-candidate direction filtering (fact 13) measured
-1.869ms before against 1.893ms after, +1.3%, memoised by stop id per vehicle.
+Matching 20 fixture vehicles: 3.35ms before memoisation, **2.00ms** after. Sharing one
+haversine per stop id already made the trigonometry cheap — 191 calls — but `_nearest`
+was invoked 857 times and re-walked the sequence each time, 40,824 iterations for those
+191 distances. `match` now memoises `_nearest` per trip and `dep_delta` per (trip,
+service date); the second key must include the date, because `load_trips` emits one
+Trip per day and the two variants share a trip_id but not a service midnight.
+`scheduled_only` 2.34ms to **0.94ms** via `Trip.target_calls`, which walks the 890 real
+calls rather than 40,284 (trip, stop) pairs. `Match.pos_idx` carries the matched
+position into `eta.predict`, saving 48 haversines per matched vehicle per poll.
 
 ## Constraints
 

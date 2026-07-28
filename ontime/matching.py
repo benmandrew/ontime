@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import config
 from .siri import Vehicle
 
 LONDON = ZoneInfo("Europe/London")
@@ -80,6 +81,27 @@ class Trip:
     @property
     def stop_ids(self) -> Iterable[str]:
         return self.index_of.keys()
+
+    @property
+    def target_calls(self) -> list[tuple[str, int | None]]:
+        """(stop_id, scheduled arrival) for the watched stops this trip calls at.
+
+        Built once per trip and kept, because `eta.scheduled_only` needs it on
+        every poll and only about one call in fifty is at a watched stop: across
+        the 890 trips the board loads, filtering `stops` inline meant walking
+        40,284 (trip, stop) pairs every fifteen seconds to reach 890 of them.
+        The trips themselves are reloaded only when the date rolls over or the
+        cache is rebuilt, so this is paid once a day rather than 5,760 times.
+        """
+        cached = getattr(self, "_target_calls", None)
+        if cached is None:
+            cached = [
+                (stop_id, arr)
+                for _seq, stop_id, arr, _lat, _lon in self.stops
+                if stop_id in config.STOP_IDS
+            ]
+            object.__setattr__(self, "_target_calls", cached)
+        return cached
 
 
 def _runs_on(conn: sqlite3.Connection, service_id: str, day: date) -> bool:
@@ -224,6 +246,11 @@ class Match:
     trip: Trip
     tier: int
     dep_delta: float  # seconds between aimed and timetabled departure
+    # Index into `trip.stops` of the stop the vehicle was closest to. Matching
+    # has to work this out to apply the off-route bound, and `eta.predict`
+    # needs the same number for the same vehicle on the same trip, so it is
+    # carried across rather than measured again from scratch.
+    pos_idx: int = -1
 
     @property
     def schedule_confident(self) -> bool:
@@ -237,10 +264,8 @@ class Match:
         return self.tier <= 3 and self.dep_delta <= TIER3_TOL
 
 
-def _dest_is_downstream(
-    trip: Trip, dest_ref: str, lat: float, lon: float, seen: dict[str, float]
-) -> bool:
-    """Whether `dest_ref` lies ahead of a vehicle at (lat, lon) on this trip.
+def _dest_is_downstream(trip: Trip, dest_ref: str, here: int) -> bool:
+    """Whether `dest_ref` lies ahead of a vehicle whose closest stop is `here`.
 
     This is the direction test. A route's two directions are separate trips,
     and only one of them is cached when a watched stop is served in a single
@@ -254,18 +279,17 @@ def _dest_is_downstream(
     does. Requiring the destination to come *after* the vehicle's position
     separates them properly.
 
-    The position is resolved against *this* trip, not borrowed from another
+    `here` must be resolved against *this* trip, not borrowed from another
     candidate. Sharing one anchor was cheaper but depended on list order: a
     trip running the other way reaches `serving` precisely because the termini
     share a code, and its intermediate stops carry the across-the-road codes,
     which appear on no forward trip. Whenever such a trip happened to sort
     first, its anchor was a stop id the forward candidates had never heard of,
     every one of them looked up None, and the correct match was thrown away.
-    Cached route variants that skip the anchor stop failed the same way.
-    Resolving per candidate costs little once distances are shared — see
-    `_nearest`.
+    Cached route variants that skip the anchor stop failed the same way. The
+    caller therefore passes each candidate's own nearest stop, which costs
+    nothing extra now that `match` memoises it.
     """
-    here = _nearest(trip, lat, lon, seen)[0]
     there = trip.index_of.get(dest_ref)
     return there is not None and there > here
 
@@ -279,14 +303,28 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
     # One haversine per distinct stop id, shared by every candidate below.
     seen: dict[str, float] = {}
 
+    # ...and one *walk* of each candidate's stop list, likewise. Sharing `seen`
+    # already made the trigonometry cheap — 191 haversines for twenty vehicles —
+    # but every call still re-walked the whole sequence to find the minimum, and
+    # the same trip is asked the same question several times over: once by the
+    # direction filter, once for each tier's tie-break, once more for the
+    # winner's off-route bound. That came to 857 walks and 40,824 iterations to
+    # arrive at those 191 distances. The answer depends only on the trip and a
+    # position that does not change within a call, so it is worth remembering.
+    near_memo: dict[str, tuple[int, float]] = {}
+
+    def nearest(trip: Trip) -> tuple[int, float]:
+        hit = near_memo.get(trip.trip_id)
+        if hit is None:
+            hit = near_memo[trip.trip_id] = _nearest(trip, vehicle.lat, vehicle.lon, seen)
+        return hit
+
     if vehicle.dest_ref:
         serving = [t for t in pool if vehicle.dest_ref in t.index_of]
         if not serving:
             return None
         heading_there = [
-            t
-            for t in serving
-            if _dest_is_downstream(t, vehicle.dest_ref, vehicle.lat, vehicle.lon, seen)
+            t for t in serving if _dest_is_downstream(t, vehicle.dest_ref, nearest(t)[0])
         ]
         if not heading_there:
             # Going somewhere this timetable does not reach from here: another
@@ -295,22 +333,39 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
             return None
         pool = heading_there
 
-    dep_offsets: list[tuple[date, int]] = []
+    # Offsets bucketed by service date, so a candidate looks its own day up
+    # instead of the list being rescanned twice — once to test that anything
+    # matches, once to take the minimum.
+    offsets_for: dict[date, list[int]] = {}
     if vehicle.origin_dep is not None:
-        dep_offsets = service_day_offsets(vehicle.origin_dep)
+        for day, secs in service_day_offsets(vehicle.origin_dep):
+            offsets_for.setdefault(day, []).append(secs)
+
+    # Memoised for the same reason as `nearest`: each candidate is asked once
+    # per tier it is a member of, and again by that tier's `min` key.
+    #
+    # Keyed on the service date as well as the trip, which `nearest` does not
+    # need to be. `load_trips` emits one Trip per (trip, day), so today's and
+    # yesterday's runs of one timetabled journey arrive as two candidates
+    # sharing a trip_id. They share their stop list too — the same object — so
+    # their nearest stop is by construction identical, but their departure
+    # deltas are measured against different service midnights and are not.
+    # Keying this on trip_id alone would hand the second variant the first
+    # one's delta and quietly match the wrong day's run.
+    delta_memo: dict[tuple[str, date], float] = {}
 
     def dep_delta(t: Trip) -> float:
-        if not dep_offsets or t.first_dep < 0:
-            return float("inf")
-        return (
-            min(
-                abs(t.first_dep - secs)
-                for day, secs in dep_offsets
-                if day == t.service_date
+        key = (t.trip_id, t.service_date)
+        hit = delta_memo.get(key)
+        if hit is None:
+            secs = offsets_for.get(t.service_date)
+            hit = (
+                min(abs(t.first_dep - s) for s in secs)
+                if secs and t.first_dep >= 0
+                else float("inf")
             )
-            if any(day == t.service_date for day, _ in dep_offsets)
-            else float("inf")
-        )
+            delta_memo[key] = hit
+        return hit
 
     tiers = (
         [
@@ -337,29 +392,28 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
         # set sits within metres of the vehicle and the "closest path" is
         # arbitrary. Choosing that way produced delays of 20 to 45 minutes on
         # buses that were running to time.
-        best = min(
-            tier,
-            key=lambda t: (dep_delta(t), _nearest(t, vehicle.lat, vehicle.lon, seen)[1]),
-        )
+        best = min(tier, key=lambda t: (dep_delta(t), nearest(t)[1]))
         # Matching refs are not proof the vehicle is running the trip. Operators
         # keep broadcasting a finished journey's origin, destination and aimed
         # departure while the bus drives back to the depot, and those refs match
         # perfectly at tier 1 from twelve kilometres off the corridor. This is a
         # sanity bound on the winner, never a way of choosing between candidates
         # — they all share one road, so distance cannot rank them.
-        if _nearest(best, vehicle.lat, vehicle.lon, seen)[1] > MAX_OFF_ROUTE_M:
+        best_i, best_d = nearest(best)
+        if best_d > MAX_OFF_ROUTE_M:
             # Fall through rather than return. A looser tier cannot rescue a bus
             # that is genuinely elsewhere, but the geometric tier below can still
             # place one whose refs point at the wrong variant of its own route,
             # and it will say so by withholding schedule confidence.
             continue
-        return Match(best, level, dep_delta(best))
+        return Match(best, level, dep_delta(best), best_i)
 
     # Nothing to go on but geometry, which happens when the feed omits
     # OriginAimedDepartureTime. Good enough to place the vehicle on the route
     # and estimate an arrival; not good enough to name the run, so the caller
     # is told not to trust the schedule comparison.
-    best = min(pool, key=lambda t: _nearest(t, vehicle.lat, vehicle.lon, seen)[1])
-    if _nearest(best, vehicle.lat, vehicle.lon, seen)[1] >= TIER4_MAX_OFF_ROUTE_M:
+    best = min(pool, key=lambda t: nearest(t)[1])
+    best_i, best_d = nearest(best)
+    if best_d >= TIER4_MAX_OFF_ROUTE_M:
         return None
-    return Match(best, 4, float("inf"))
+    return Match(best, 4, float("inf"), best_i)

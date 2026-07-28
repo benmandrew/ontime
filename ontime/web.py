@@ -148,6 +148,8 @@ def build_board(conn) -> dict:
                 state.segments,
                 now=now,
                 schedule_confident=found.schedule_confident,
+                # Matching already resolved where on this trip the vehicle is.
+                pos_idx=found.pos_idx,
             )
             if p and p.minutes is not None and -1 <= p.minutes <= config.HORIZON_SECS / 60:
                 preds.append(p)

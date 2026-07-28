@@ -14,7 +14,6 @@ import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from . import config
 from .matching import LONDON, Trip, nearest_on_trip, service_midnight
 from .siri import Vehicle
 
@@ -85,6 +84,7 @@ def predict(
     segments: dict,
     now: float | None = None,
     schedule_confident: bool = True,
+    pos_idx: int | None = None,
 ) -> Prediction | None:
     """Predict this vehicle's arrival at one stop, or None if it has passed.
 
@@ -92,14 +92,26 @@ def predict(
     is. When it did not, the arrival estimate still holds — every trip on a
     route walks the same stops — but the scheduled time would come from an
     arbitrary run, so no delay is reported rather than a fictional one.
+
+    `pos_idx` is the vehicle's closest stop on this trip, which `match` has
+    already had to work out; passing it through skips re-measuring the whole
+    stop sequence once per watched stop, three times over per vehicle, for an
+    answer that cannot differ. Callers without a `Match` in hand — the tests
+    and the benchmark — leave it out and it is measured here as before.
     """
     now = now or datetime.now(UTC).timestamp()
 
+    # Deliberately the first occurrence, not `trip.index_of`, which is built as
+    # a dict comprehension and so holds the last. Nothing in the cache calls at
+    # a watched stop twice today, so the two agree — but a loop route in some
+    # later archive would make them disagree, and the ETA would move without
+    # anything saying so. The scan is a few dozen comparisons.
     target_idx = next((i for i, s in enumerate(trip.stops) if s[1] == target_stop_id), None)
     if target_idx is None:
         return None
 
-    pos_idx, _pos_dist, _seq = nearest_on_trip(trip, vehicle.lat, vehicle.lon)
+    if pos_idx is None:
+        pos_idx = nearest_on_trip(trip, vehicle.lat, vehicle.lon)[0]
     if pos_idx > target_idx:
         return None
 
@@ -177,9 +189,10 @@ def scheduled_only(
     for trip in trips:
         if trip.trip_id in matched_trip_ids:
             continue
-        for _seq, stop_id, arr, _lat, _lon in trip.stops:
-            if stop_id not in config.STOP_IDS:
-                continue
+        # `trip.target_calls`, not a filter over `trip.stops`: only about one
+        # call in fifty is at a watched stop, so scanning the full sequence
+        # walked 40,284 (trip, stop) pairs every poll to reach 890 of them.
+        for stop_id, arr in trip.target_calls:
             ts = sched_timestamp(trip, arr)
             if ts is None or not (now - 60 <= ts <= now + horizon):
                 continue
