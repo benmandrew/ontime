@@ -57,6 +57,53 @@ def test_malformed_activities_are_skipped():
     assert len(vehicles) == 1
 
 
+def test_one_malformed_bearing_does_not_cost_the_poll_its_other_vehicles():
+    """A non-numeric Bearing used to raise straight out of `parse`.
+
+    The float() call sat outside the guard that covers latitude and longitude,
+    so one bad field among the ~400 vehicles in a cycle propagated through
+    `fetch` and `poll_once` and left `web.poll_and_store` replacing the whole
+    board with an error state — every stop blank until the next poll.
+    """
+    now = datetime.now(UTC)
+    args = {
+        "origin_ref": "A",
+        "dest_ref": "B",
+        "origin_dep": now,
+        "recorded_at": now,
+        "lat": 53.46,
+        "lon": -2.22,
+    }
+    bad = vehicle_xml(line="192", vehicle_ref="BAD", **args).replace(
+        "<Bearing>90</Bearing>", "<Bearing>NNE</Bearing>"
+    )
+    good = vehicle_xml(line="192", vehicle_ref="GOOD", **args)
+
+    vehicles = siri.parse(siri_document([bad, good]))
+
+    assert [v.vehicle_ref for v in vehicles] == ["BAD", "GOOD"]
+    assert vehicles[0].bearing is None, "a bad bearing costs that field, nothing else"
+    assert vehicles[1].bearing == 90.0
+
+
+def test_hostile_feed_text_is_carried_through_unaltered(real_siri_xml):
+    """The parser is not an escaping boundary, and must not be mistaken for one.
+
+    DestinationName is operator-supplied free text that reaches the browser
+    through the board. Nothing here neutralises it, which is why the dashboard
+    escapes every feed-derived value before it lands in innerHTML — see
+    `tests/test_e2e.py::TestDashboardRendering`.
+    """
+    payload = re.sub(
+        rb"<DestinationName>[^<]+</DestinationName>",
+        b"<DestinationName>&lt;img src=x onerror=alert(1)&gt;</DestinationName>",
+        real_siri_xml,
+        count=1,
+    )
+    dest_names = {v.dest_name for v in siri.parse(payload)}
+    assert "<img src=x onerror=alert(1)>" in dest_names
+
+
 def test_age_and_staleness(monkeypatch, api_key):
     now = datetime.now(UTC)
     fresh = vehicle_xml(

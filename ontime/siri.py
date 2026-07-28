@@ -43,6 +43,23 @@ def _text(node: ET.Element, tag: str) -> str:
     return (found.text or "").strip() if found is not None and found.text else ""
 
 
+def _float(node: ET.Element, tag: str) -> float | None:
+    """A numeric field that the vehicle can do without.
+
+    Position is different — a vehicle with no coordinates is useless and gets
+    dropped — but everything else is decoration. One operator emitting a
+    non-numeric Bearing used to raise out of `parse` and cost the whole poll
+    its ~400 vehicles, blanking every stop on the board.
+    """
+    raw = _text(node, tag)
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
 def _time(node: ET.Element, tag: str) -> datetime | None:
     raw = _text(node, tag)
     if not raw:
@@ -67,7 +84,6 @@ def parse(xml: bytes) -> list[Vehicle]:
             lon = float(_text(loc, "Longitude"))
         except ValueError:
             continue
-        bearing_raw = _text(act, "Bearing")
         out.append(
             Vehicle(
                 vehicle_ref=_text(act, "VehicleRef"),
@@ -82,7 +98,7 @@ def parse(xml: bytes) -> list[Vehicle]:
                 recorded_at=recorded,
                 lat=lat,
                 lon=lon,
-                bearing=float(bearing_raw) if bearing_raw else None,
+                bearing=_float(act, "Bearing"),
             )
         )
     return out
