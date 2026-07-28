@@ -395,6 +395,134 @@ class TestHttpApi:
         # A hash covers a <style> element but never a style="" attribute.
         assert 'style="' not in r.text
 
+    def test_the_policy_admits_the_basemap_and_nothing_further(self, live_app):
+        """The tiles are the only third party the page touches.
+
+        `img-src` is derived from `config.MAP_TILE_URL` rather than written out
+        again, so this checks the two agree — a policy that disagrees with the
+        tile source fails as a blank grey map with nothing in the log.
+        """
+        with TestClient(web.app) as client:
+            csp = client.get("/").headers["content-security-policy"]
+
+        img = next(d for d in csp.split("; ") if d.startswith("img-src "))
+        assert web.tile_origin(config.MAP_TILE_URL) in img
+        assert "https://tile.openstreetmap.org" in img
+        # Tiles are <img> loads. Nothing on the page opens a socket elsewhere.
+        assert "connect-src 'self'" in csp
+        for directive in csp.split("; "):
+            if directive.startswith(("img-src", "script-src", "style-src")):
+                continue
+            assert "http" not in directive, f"{directive} reaches off-origin"
+
+    def test_vendored_leaflet_is_served_and_the_page_asks_for_what_exists(self, live_app):
+        """The page hardcodes these paths; a rename would 404 in the browser only."""
+        with TestClient(web.app) as client:
+            page = client.get("/").text
+            for name, media in (("leaflet.js", "javascript"), ("leaflet.css", "css")):
+                assert f"/vendor/{name}" in page, f"the page never loads {name}"
+                r = client.get(f"/vendor/{name}")
+                assert r.status_code == 200
+                assert media in r.headers["content-type"]
+                assert r.headers["x-content-type-options"] == "nosniff"
+
+    def test_everything_the_server_serves_is_packaged(self):
+        """The image installs the package; it does not copy the tree.
+
+        So a file the server serves but `package-data` does not list works in a
+        checkout and 404s in the container — which is where the map runs. This
+        checks the globs cover every static file, rather than trusting that
+        whoever adds one remembers to widen them.
+        """
+        import fnmatch
+        import tomllib
+
+        pyproject = tomllib.loads((config.ROOT / "pyproject.toml").read_text())
+        globs = pyproject["tool"]["setuptools"]["package-data"]["ontime"]
+
+        served = sorted(p for p in web.STATIC.rglob("*") if p.is_file())
+        assert served, "no static files found at all"
+        for path in served:
+            rel = path.relative_to(web.STATIC.parent).as_posix()
+            assert any(fnmatch.fnmatch(rel, g) for g in globs), (
+                f"{rel} is served but no package-data glob in {globs} ships it"
+            )
+
+    def test_vendor_route_serves_only_the_two_files_it_knows(self, live_app):
+        """Named files rather than a directory mount, so there is nothing to walk."""
+        with TestClient(web.app) as client:
+            for name in ("leaflet.js.map", "../dashboard.html", "%2e%2e%2fdashboard.html"):
+                assert client.get(f"/vendor/{name}").status_code == 404
+
+    def test_json_routes_refuse_to_be_run_as_script(self, live_app):
+        """'self' in script-src makes every route here a candidate <script src>.
+
+        These carry operator free text, so the content type has to be one the
+        browser will not second-guess.
+        """
+        with TestClient(web.app) as client:
+            for path in ("/api/board", "/api/map", "/api/stops", "/healthz"):
+                r = client.get(path)
+                assert r.headers["x-content-type-options"] == "nosniff", path
+                assert r.headers["content-type"].startswith("application/json"), path
+
+    def test_map_endpoint_carries_the_basemap_and_route_lines(self, live_app):
+        with TestClient(web.app) as client:
+            client.get("/api/board")  # the lines are built when the timetable loads
+            body = client.get("/api/map").json()
+
+        assert body["tile_url"] == config.MAP_TILE_URL
+        assert body["attribution"], "OpenStreetMap's licence requires the credit"
+        assert body["routes"], "the mini archive serves at least one route"
+        for line in body["routes"]:
+            assert len(line["points"]) >= 2, "a line needs two points to be a line"
+            for lat, lon in line["points"]:
+                assert 53.0 < lat < 54.0 and -3.0 < lon < -1.5, "outside Greater Manchester"
+
+    def test_board_places_every_stop_the_archive_knows(self, live_app):
+        """The map cannot pin a stop the board does not locate.
+
+        The cache holds coordinates only for stops the watched trips call at,
+        and `STOP_ABSENT` is served by no trip in the mini archive — so it is
+        reported unplaced. Null rather than (0, 0): a pin in the Atlantic is a
+        worse answer than no pin, and the page filters on exactly this.
+        """
+        with TestClient(web.app) as client:
+            stops = {s["atco"]: s for s in client.get("/api/board").json()["stops"]}
+
+        assert stops[STOP_ABSENT]["lat"] is None
+        assert stops[STOP_ABSENT]["lon"] is None
+        for atco in (STOP_50, STOP_192):
+            assert 53.0 < stops[atco]["lat"] < 54.0, stops[atco]
+            assert -3.0 < stops[atco]["lon"] < -1.5, stops[atco]
+
+    def test_a_rebuilt_timetable_re_reads_the_stop_positions(self, live_app):
+        """A stop gaining its first trip gains its first position with it.
+
+        The positions are cached because they cannot change between polls, and
+        a partial answer — which is what the mini archive produces — would
+        otherwise be held until the process restarted.
+        """
+        with TestClient(web.app) as client:
+            client.get("/api/board")
+            assert web.state.stop_points, "positions should be cached after a poll"
+
+            web.state.trips_built = "forces a reload on the next poll"
+            conn = db.connect()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO stops VALUES (?,?,?,?,?)",
+                    (STOP_ABSENT, "MANADGMT", "Hyde Grove", 53.4641, -2.2223),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            web.state.board = web.poll_once()
+            stops = {s["atco"]: s for s in web.state.board["stops"]}
+
+        assert stops[STOP_ABSENT]["lat"] == pytest.approx(53.4641)
+
     def test_a_bus_exactly_on_time_is_not_reported_as_unknown(self, live_app, monkeypatch):
         """A delay of 0.0 is falsy, and null on this field means "not known".
 

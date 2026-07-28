@@ -14,8 +14,10 @@ import hashlib
 import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
+from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
@@ -46,6 +48,9 @@ class State:
         self.vehicles: list = []
         self.last_poll: float | None = None
         self.routes: set[str] = set()
+        self.stop_points: dict[str, tuple[float, float]] = {}
+        # The map's route lines, rebuilt with the timetable rather than per poll.
+        self.map_routes: list[dict] | None = None
 
 
 state = State()
@@ -93,6 +98,12 @@ def refresh_timetable(conn) -> None:
     state.trips_for = today
     state.trips_built = built
     state.routes = {t.route_name for t in state.trips}
+    state.map_routes = _route_lines(trips)
+    # Both are read out of the timetable cache, so a rebuild is exactly when
+    # they can change — including a watched stop gaining its first trip, and so
+    # its first position. Without this the partial answer would be kept until
+    # the process next restarted.
+    state.stop_points = {}
     log.info(
         "timetable loaded: %d trips for %s, routes %s, cache built %s",
         len(state.trips),
@@ -100,6 +111,56 @@ def refresh_timetable(conn) -> None:
         sorted(state.routes),
         built,
     )
+
+
+def _route_lines(trips: list[Trip]) -> list[dict]:
+    """One polyline per route: the longest stop sequence any of its trips runs.
+
+    GTFS ships real road geometry in `shapes.txt`, but not for these operators.
+    Every one of the watched trips carries an empty `shape_id`, as do 63% of the
+    North West feed's 106,058 trips, so scanning that 131MB member would return
+    nothing for this board. The line is therefore drawn through the stops
+    themselves. Median stop spacing is 284m, which follows a straight road
+    closely and cuts the corner at a bend: it is context beneath the pins, not a
+    claim about which streets the bus uses.
+
+    The longest variant per route is enough. Across the nine routes it covers
+    every stop their other variants call at, bar two on the 192 and two on the
+    53 — so a short working contributes nothing a rider would notice.
+    """
+    longest: dict[str, Trip] = {}
+    for t in trips:
+        best = longest.get(t.route_name)
+        if best is None or len(t.stops) > len(best.stops):
+            longest[t.route_name] = t
+    return [
+        {"route": name, "points": [[lat, lon] for _seq, _sid, _arr, lat, lon in trip.stops]}
+        for name, trip in sorted(longest.items())
+    ]
+
+
+def refresh_stop_points(conn) -> None:
+    """Coordinates for the watched stops, read once and kept.
+
+    `config.STOPS` carries the codes and the human-readable text but no
+    position; the coordinates come from GTFS `stops.txt` via the cache, which
+    holds only the stops the watched trips call at — so a stop no cached trip
+    serves has none, and the board reports it unplaced rather than at (0, 0).
+
+    An empty result is deliberately not cached, for the reason
+    `refresh_timetable` gives: against a cold volume the first polls read a
+    database the ingest has not filled yet, and pinning that would leave the
+    map permanently blank. A partial result is cached, but `refresh_timetable`
+    clears it whenever the cache is rebuilt.
+    """
+    if state.stop_points:
+        return
+    placeholders = ",".join("?" * len(config.STOPS))
+    rows = conn.execute(
+        f"SELECT stop_id, lat, lon FROM stops WHERE stop_id IN ({placeholders})",
+        tuple(s.atco for s in config.STOPS),
+    ).fetchall()
+    state.stop_points = {r["stop_id"]: (r["lat"], r["lon"]) for r in rows}
 
 
 def refresh_segments(conn) -> None:
@@ -162,12 +223,17 @@ def build_board(conn) -> dict:
         rows = sorted(
             (p for p in preds if p.stop_id == stop.atco), key=lambda p: p.eta_ts or 0
         )[:12]
+        point = state.stop_points.get(stop.atco)
         stops_out.append(
             {
                 "atco": stop.atco,
                 "naptan": stop.naptan,
                 "name": stop.name,
                 "detail": stop.detail,
+                # None until the timetable cache exists. The map skips a stop it
+                # cannot place rather than dropping a pin at (0, 0).
+                "lat": point[0] if point else None,
+                "lon": point[1] if point else None,
                 "departures": [
                     {
                         "route": p.route_name,
@@ -221,6 +287,7 @@ def poll_once() -> dict:
     try:
         db.init(conn)
         refresh_timetable(conn)
+        refresh_stop_points(conn)
         refresh_segments(conn)
         return build_board(conn)
     finally:
@@ -263,8 +330,35 @@ async def lifespan(_app: Starlette):
         locking.release("poller")
 
 
+def _json(body, status_code: int = 200) -> JSONResponse:
+    """A JSON response the browser will not be talked into running as script.
+
+    `script-src` gained 'self' when Leaflet was vendored, so every same-origin
+    URL is now a permitted script source — including these, which carry operator
+    free text straight from the feed. `nosniff` makes the browser honour the
+    JSON content type and refuse to execute them.
+    """
+    return JSONResponse(body, status_code=status_code, headers=NOSNIFF)
+
+
 async def api_board(_request: Request) -> JSONResponse:
-    return JSONResponse(state.board)
+    return _json(state.board)
+
+
+async def api_map(_request: Request) -> JSONResponse:
+    """What the map needs and the board poll does not carry.
+
+    The route lines are some 450 points and are rebuilt only when the timetable
+    is, so the page fetches this once on load rather than every ten seconds.
+    """
+    return _json(
+        {
+            "tile_url": config.MAP_TILE_URL,
+            "attribution": config.MAP_ATTRIBUTION,
+            "max_zoom": config.MAP_MAX_ZOOM,
+            "routes": state.map_routes or [],
+        }
+    )
 
 
 async def healthz(_request: Request) -> JSONResponse:
@@ -277,11 +371,11 @@ async def healthz(_request: Request) -> JSONResponse:
         "updated": state.board.get("updated"),
         "error": state.board.get("error"),
     }
-    return JSONResponse(body, status_code=200 if fresh else 503)
+    return _json(body, status_code=200 if fresh else 503)
 
 
 async def api_stops(_request: Request) -> JSONResponse:
-    return JSONResponse(
+    return _json(
         [
             {
                 "atco": s.atco,
@@ -302,6 +396,21 @@ def _inline_hashes(html: str, tag: str) -> list[str]:
     ]
 
 
+def tile_origin(url: str) -> str:
+    """The `img-src` source that permits the configured tile server.
+
+    Derived from `config.MAP_TILE_URL` rather than written out a second time,
+    because a policy that disagrees with the tile source fails as a blank grey
+    map with nothing in the server log to explain it. Leaflet fills `{s}` from
+    its subdomain list, so a URL using one has no single host and only the
+    wildcard form covers it.
+    """
+    parts = urlsplit(url.replace("{s}", "*"))
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"MAP_TILE_URL must be an absolute http(s) URL: {url!r}")
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 def content_security_policy(html: str) -> str:
     """Lock the page down to exactly the script and stylesheet it ships with.
 
@@ -312,13 +421,23 @@ def content_security_policy(html: str) -> str:
     hashes are computed from the file at import, so editing the page cannot
     silently break it — and the page carries no inline style *attributes*,
     which a hash cannot cover.
+
+    'self' joins the script and style sources for the vendored Leaflet, which
+    is far too large to inline and hash. That is a real widening — any URL this
+    server answers is now a permitted script — so the JSON routes, which carry
+    operator free text, are served `nosniff` to stop one being loaded as script.
+    The map is also the only part of the page that talks to anyone else: the
+    basemap tiles are `<img>` loads from the tile server, and `img-src` names
+    that origin and nothing more. `data:` is there because Leaflet swaps in a
+    1x1 data URI when it abandons a tile request, not for anything we draw.
     """
     return "; ".join(
         [
             "default-src 'none'",
-            "script-src " + " ".join(_inline_hashes(html, "script")),
-            "style-src " + " ".join(_inline_hashes(html, "style")),
-            "connect-src 'self'",  # the page's own /api/board poll
+            "script-src 'self' " + " ".join(_inline_hashes(html, "script")),
+            "style-src 'self' " + " ".join(_inline_hashes(html, "style")),
+            "img-src 'self' data: " + tile_origin(config.MAP_TILE_URL),
+            "connect-src 'self'",  # the page's own /api/board and /api/map polls
             "base-uri 'none'",
             "form-action 'none'",
             "frame-ancestors 'none'",
@@ -329,11 +448,44 @@ def content_security_policy(html: str) -> str:
 DASHBOARD = STATIC / "dashboard.html"
 CSP = content_security_policy(DASHBOARD.read_text())
 
+NOSNIFF = {"X-Content-Type-Options": "nosniff"}
+
+# Leaflet 1.9.4, vendored rather than pulled from a CDN. The page names no
+# external script or style source, and a dashboard that stops drawing because
+# someone else's CDN is unreachable is not worth the 160KB saved. These are the
+# published dist artefacts unmodified; their digests match the SRI values on
+# leafletjs.com for that release:
+#   leaflet.js   sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=
+#   leaflet.css  sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=
+# The three `url()` references in the stylesheet are for the layers control and
+# the default marker icon; the page uses neither, so nothing requests them.
+VENDOR = STATIC / "vendor"
+
+# Served by name rather than through a StaticFiles mount: two known files need
+# no directory traversal surface. FileResponse sets ETag and Last-Modified, so
+# an hour is only about how often the browser revalidates, not how stale it gets.
+_VENDOR_FILES = {
+    "leaflet.js": (VENDOR / "leaflet.js", "text/javascript"),
+    "leaflet.css": (VENDOR / "leaflet.css", "text/css"),
+}
+
+
+async def vendor(request: Request) -> FileResponse:
+    entry = _VENDOR_FILES.get(request.path_params["name"])
+    if entry is None:
+        raise HTTPException(status_code=404)
+    path, media_type = entry
+    return FileResponse(
+        path,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600", **NOSNIFF},
+    )
+
 
 async def index(_request: Request) -> FileResponse:
     return FileResponse(
         DASHBOARD,
-        headers={"Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff"},
+        headers={"Content-Security-Policy": CSP, **NOSNIFF},
     )
 
 
@@ -344,7 +496,9 @@ async def index(_request: Request) -> FileResponse:
 app = Starlette(
     routes=[
         Route("/", index),
+        Route("/vendor/{name}", vendor),
         Route("/api/board", api_board),
+        Route("/api/map", api_map),
         Route("/api/stops", api_stops),
         Route("/healthz", healthz),
     ],

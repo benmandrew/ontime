@@ -24,7 +24,9 @@ ontime = "ontime.web:main"
 include = ["ontime*"]
 
 [tool.setuptools.package-data]
-ontime = ["static/*.html"]
+# The image installs the package rather than copying the tree, so anything the
+# server serves has to be listed here or it exists only in the source checkout.
+ontime = ["static/*.html", "static/vendor/*"]
 
 [tool.ruff]
 line-length = 92

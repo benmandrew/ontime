@@ -4,17 +4,22 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ontime — live departures</title>
+<link rel="stylesheet" href="/vendor/leaflet.css">
 <style>
   :root {
     --bg: #0f1115; --panel: #171a21; --line: #262b36;
     --ink: #e8eaf0; --dim: #939aab; --accent: #ffd166;
     --live: #4ade80; --late: #f87171; --sched: #64748b;
+    /* Route lines need to win against OpenStreetMap's own palette, which has
+       already spent orange and yellow on A-roads and blue on water. */
+    --route: #a78bfa;
   }
   @media (prefers-color-scheme: light) {
     :root {
       --bg: #f5f6f8; --panel: #ffffff; --line: #e2e5ea;
       --ink: #14161b; --dim: #5f6672; --accent: #b4700a;
       --live: #15803d; --late: #b91c1c; --sched: #6b7280;
+      --route: #6d28d9;
     }
   }
   * { box-sizing: border-box; }
@@ -42,6 +47,40 @@
   .t-learned { color: var(--live); } .t-timetable { color: var(--accent); } .t-scheduled { color: var(--sched); }
   .late { color: var(--late); } .early { color: var(--live); }
   .empty { padding: .9rem; color: var(--dim); font-size: .85rem; }
+  /* Map. Every colour here comes from the same custom properties as the board,
+     so the basemap furniture follows the light/dark switch with everything else. */
+  .mapcard { margin-top: 1rem; background: var(--panel); border: 1px solid var(--line);
+             border-radius: 10px; overflow: hidden; }
+  .mapcard h2 { font-size: .95rem; margin: 0; padding: .7rem .9rem .15rem; }
+  .mapcard .sub { padding: 0 .9rem .6rem; color: var(--dim); font-size: .75rem; }
+  #map { height: 26rem; width: 100%; border-top: 1px solid var(--line); background: var(--panel); }
+  .leaflet-container { background: var(--panel); font: inherit; }
+  /* Route lines are Leaflet paths given a className, so they are themed here
+     rather than by passing literal colours to the plugin. Two strokes: a wide
+     pale casing under a narrower core, which is how the basemap draws its own
+     roads and the only way a thin line stays legible over a busy one. */
+  .route-line { fill: none; stroke: var(--route); }
+  .route-case { fill: none; stroke: var(--panel); stroke-width: 7; opacity: .55; }
+  .route-core { stroke-width: 3.5; opacity: .8; }
+  /* Stops are pins and buses are dots. Shape carries the distinction, because
+     colour alone disappears over a basemap that is already full of it. */
+  .stop-pin, .bus-pin { background: none; border: 0; }
+  .stop-pin svg, .bus-pin svg { display: block; overflow: visible; }
+  .stop-body { fill: var(--accent); stroke: var(--panel); stroke-width: 1.75; }
+  .stop-eye { fill: var(--panel); }
+  .bus-dot { fill: var(--live); stroke: var(--panel); stroke-width: 2; }
+  .bus-arrow { fill: var(--live); stroke: var(--panel); stroke-width: 1.5; }
+  .bus-label { position: absolute; inset: 0; display: flex; align-items: center;
+               justify-content: center; font-size: .6rem; font-weight: 700;
+               color: var(--bg); pointer-events: none; }
+  .leaflet-popup-content-wrapper, .leaflet-popup-tip {
+    background: var(--panel); color: var(--ink); box-shadow: 0 2px 10px rgba(0,0,0,.35); }
+  .leaflet-popup-content { margin: .55rem .75rem; font-size: .8rem; line-height: 1.4; }
+  .leaflet-popup-content b { font-variant-numeric: tabular-nums; }
+  .leaflet-control-attribution { background: var(--panel); color: var(--dim); font-size: .65rem; }
+  .leaflet-control-attribution a { color: var(--dim); }
+  .leaflet-bar a { background: var(--panel); color: var(--ink); border-bottom-color: var(--line); }
+  .leaflet-bar a:hover { background: var(--line); color: var(--ink); }
   footer { margin-top: 1.1rem; color: var(--dim); font-size: .75rem; }
   .err { background: #7f1d1d; color: #fff; padding: .5rem .8rem; border-radius: 8px; margin-bottom: .8rem; }
   .warn { background: #78350f; color: #fff; padding: .5rem .8rem; border-radius: 8px; margin-bottom: .8rem; }
@@ -55,8 +94,17 @@
 </header>
 <div id="err"></div>
 <div class="grid" id="grid"></div>
+
+<section class="mapcard">
+  <h2>Where the buses are</h2>
+  <div class="sub">Live positions, updated with the board. Route lines are drawn
+    through each route's stops — the operators publish no road geometry for these services.</div>
+  <div id="map"></div>
+</section>
+
 <footer id="foot"></footer>
 
+<script src="/vendor/leaflet.js"></script>
 <script>
 // Route names, headsigns and destinations are the operator's text, passed
 // through by the server untouched, and every one of them lands in innerHTML
@@ -121,12 +169,116 @@ function render(data) {
   document.getElementById('meta').textContent = (c && data.updated)
     ? `updated ${fmtClock(data.updated)} · ${c.matched}/${c.feed} vehicles matched`
     : 'no data yet';
+  updateMap(data);
+
   document.getElementById('foot').textContent =
     `Timetable: ${noTimetable ? 'not loaded' :
       `${tt.trips.toLocaleString()} trips for ${tt.date} across ${tt.routes.length} routes`} · ` +
     `History: ${(h.observations || 0).toLocaleString()} positions over ${h.history_days || 0} days · ` +
     `${(h.stop_events || 0).toLocaleString()} stop events · ${h.learned_segments || 0} learned segments. ` +
     `Green "learned" rows use observed run-times; amber "est" rows fall back to the timetable.`;
+}
+
+// ---- Map --------------------------------------------------------------------
+// Leaflet is vendored and served from this origin, but the board is the point of
+// the page and must survive without it: every entry point below returns quietly
+// if the plugin is missing, so a failed /vendor request costs the map alone.
+let map = null, routePane = null, stopLayer = null, busLayer = null, framed = false;
+
+function initMap() {
+  if (typeof L === 'undefined') return;
+  // Central Manchester, held only until the first board arrives with real
+  // coordinates to frame; fitBounds needs a map that already has a view.
+  map = L.map('map').setView([53.46, -2.21], 12);
+  // Route lines belong under the pins. Draw order inside one pane follows
+  // insertion, and the lines arrive from their own fetch well after the first
+  // stop markers, so separating the panes is what actually keeps them beneath.
+  map.createPane('routes').style.zIndex = 380;  // overlayPane is 400
+  stopLayer = L.layerGroup().addTo(map);
+  busLayer = L.layerGroup().addTo(map);
+  fetch('/api/map').then(r => r.json()).then(drawBasemap).catch(() => {});
+}
+
+function drawBasemap(cfg) {
+  L.tileLayer(cfg.tile_url, {
+    maxZoom: cfg.max_zoom || 18,
+    // OpenStreetMap's licence requires this to stay visible on the map.
+    attribution: cfg.attribution || '',
+  }).addTo(map);
+  (cfg.routes || []).forEach(r => {
+    if (!r.points || r.points.length < 2) return;
+    ['route-case', 'route-core'].forEach(part =>
+      L.polyline(r.points, {
+        className: `route-line ${part}`, pane: 'routes', interactive: false,
+      }).addTo(map));
+  });
+}
+
+// A pin, anchored at its point, so a stop reads as a place rather than as
+// another vehicle. Stops never move, so this is built once per stop.
+function stopIcon() {
+  return L.divIcon({
+    className: 'stop-pin', iconSize: [22, 30], iconAnchor: [11, 29], popupAnchor: [0, -28],
+    html: `<svg viewBox="0 0 22 30" width="22" height="30" aria-hidden="true">
+             <path class="stop-body" d="M11 29S20.5 17.2 20.5 10.5A9.5 9.5 0 1 0 1.5
+                   10.5C1.5 17.2 11 29 11 29Z"/>
+             <circle class="stop-eye" cx="11" cy="10.5" r="3.6"/>
+           </svg>`,
+  });
+}
+
+function busIcon(v) {
+  const b = Number(v.bearing);
+  // A bearing the feed mangled costs this one bus its arrow — never the marker,
+  // and never the poll. `b` is a finite number by here, so it cannot inject.
+  const arrow = Number.isFinite(b)
+    ? `<path class="bus-arrow" transform="rotate(${b})" d="M0,-15 L4.5,-8.5 L-4.5,-8.5 Z"/>`
+    : '';
+  return L.divIcon({
+    className: 'bus-pin', iconSize: [26, 26], iconAnchor: [13, 13], popupAnchor: [0, -14],
+    html: `<svg viewBox="-13 -13 26 26" width="26" height="26" aria-hidden="true">
+             <circle class="bus-dot" r="9"/>${arrow}
+           </svg><span class="bus-label">${esc(v.route)}</span>`,
+  });
+}
+
+function updateMap(data) {
+  if (!map) return;
+  const stops = (data.stops || []).filter(s => Number.isFinite(s.lat) && Number.isFinite(s.lon));
+  const buses = (data.vehicles || [])
+    .filter(v => Number.isFinite(v.lat) && Number.isFinite(v.lon));
+
+  // Stops do not move. Draw them on the first board that carries coordinates —
+  // which is not necessarily the first board, since a cold volume serves several
+  // polls before the timetable cache exists to read positions out of.
+  if (stops.length && !stopLayer.getLayers().length) {
+    stops.forEach(s => L.marker([s.lat, s.lon], { icon: stopIcon() })
+      .bindPopup(`<b>${esc(s.name)}</b><br>${esc(s.detail)}`)
+      .addTo(stopLayer));
+  }
+
+  busLayer.clearLayers();
+  buses.forEach(v => L.marker([v.lat, v.lon], { icon: busIcon(v) })
+    .bindPopup(`<b>${esc(v.route)}</b> ${esc(v.headsign || '')}<br>` +
+               `${esc(v.vehicle_ref)} · seen ${esc(v.age_secs)}s ago`)
+    .addTo(busLayer));
+
+  // Frame once, on the first board with anything to show, then leave the view
+  // alone: refitting every ten seconds would drag the map out from under anyone
+  // who had panned or zoomed it.
+  //
+  // On the stops, not on the buses. The feed's bounding box reaches twenty
+  // minutes upstream, so fitting to both zoomed out to the whole of Greater
+  // Manchester and left the three stops an unreadable speck in the middle —
+  // the buses were visible and the thing the board is about was not. maxZoom
+  // stops the opposite failure, where three stops a few hundred metres apart
+  // fill the frame at street level.
+  if (!framed) {
+    const pts = (stops.length ? stops : buses).map(p => [p.lat, p.lon]);
+    if (!pts.length) return;
+    map.fitBounds(L.latLngBounds(pts), { maxZoom: 14, padding: [30, 30] });
+    framed = true;
+  }
 }
 
 async function tick() {
@@ -137,6 +289,7 @@ async function tick() {
     document.getElementById('meta').textContent = 'server unreachable';
   }
 }
+initMap();
 tick();
 setInterval(tick, 10000);
 </script>

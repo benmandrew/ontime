@@ -6,6 +6,14 @@ BODS publishes vehicle positions in the *Standard Interface for Real-time Inform
 
 The feed answers *where is the bus* and never *when will it reach my stop*. Every arrival time here is computed locally: each vehicle is matched to a timetabled trip, located in that trip's stop sequence, and the remaining segments are summed. Observed traversal times accumulate over time and replace the timetabled gaps once a segment has enough samples.
 
+## The map
+
+Below the departure boards sits a map of the same data: a pin for each watched stop, and a dot for every vehicle the matcher has placed on a trip, rotated to the bearing the feed reports. Pins and dots differ in shape rather than only in colour, because the *OpenStreetMap* basemap underneath has already spent most of the palette on its own roads.
+
+Route lines are drawn through each route's stop sequence. That is not the geometry the operators intended, and the reason is worth stating: GTFS ships road shapes in `shapes.txt`, 131MB unpacked, but every one of the 1,135 watched trips carries an empty `shape_id`, as do 66,967 of the feed's 106,058 trips. There is no road geometry to draw. Stop spacing has a median of 284m, so a line through consecutive stops follows a straight road closely and cuts the corner at a bend.
+
+The basemap is the one part of this application that talks to a third party. Tiles load directly from the tile server named in `ONTIME_MAP_TILE_URL`, and the page's *Content Security Policy* (CSP) permits that origin and no other; `web.tile_origin` derives the policy from the same setting, so the two cannot drift apart. Leaflet 1.9.4 is vendored under `ontime/static/vendor/` rather than loaded from a content delivery network, which costs 162KB in the image and removes a remote dependency from a dashboard that has to work when something else is down.
+
 ## Running it
 
 The Nix flake pins the toolchain, so `direnv allow` is the only setup step. A free key takes a minute to register at [data.bus-data.dft.gov.uk](https://data.bus-data.dft.gov.uk/account/signup/).
@@ -56,6 +64,7 @@ ontime/matching.py     vehicle to trip matching
 ontime/history.py      observation storage and segment learning
 ontime/eta.py          arrival prediction
 ontime/web.py          poller and HTTP API
+ontime/static/         the dashboard page and vendored Leaflet
 ontime/maintenance.py  periodic refresh loop
 ```
 

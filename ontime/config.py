@@ -55,6 +55,19 @@ def _env_float_list(name: str, default: str) -> tuple[float, ...]:
 # Wide enough to catch buses roughly 20 minutes upstream of the stops.
 BBOX: tuple[float, ...] = _env_float_list("ONTIME_BBOX", "-2.32,53.38,-2.10,53.52")
 
+# Raster basemap for the vehicle map. The browser fetches these tiles directly
+# from the tile server, which is the one thing on the page that talks to a third
+# party — so the host has to be named in the page's `img-src` policy too.
+# `web.tile_origin` derives that from this URL rather than repeating the host,
+# because a policy that disagrees with the tile source fails as a blank map with
+# nothing in the log to say why.
+MAP_TILE_URL = os.getenv(
+    "ONTIME_MAP_TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+)
+# OpenStreetMap's licence requires the credit to be visible on the map itself.
+MAP_ATTRIBUTION = os.getenv("ONTIME_MAP_ATTRIBUTION", "© OpenStreetMap contributors")
+MAP_MAX_ZOOM = int(os.getenv("ONTIME_MAP_MAX_ZOOM", "18"))
+
 POLL_SECS = int(os.getenv("ONTIME_POLL_SECS", "15"))
 
 # Records older than this are ghosts: the BODS feed retains vehicles for hours

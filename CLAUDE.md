@@ -123,7 +123,35 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     text can only corrupt the discarded remainder. A reordered header falls back to
     `csv` rather than caching shifted times — a failed rebuild means a board ageing
     by a day per day, so this path must never simply raise.
-20. **Bound anything that re-aggregates history.** `learn_segments` reads all of
+20. **There is no published road geometry for these routes.** `shapes.txt` is
+    131MB unpacked (the 20.5MB in 4 is its *zipped* size), grouped by shape_id,
+    1.82s to scan — and worthless here: all 1,135 watched trips carry an empty
+    `shape_id`, as do 66,967 of the feed's 106,058. Do not scan it hoping for
+    better. The map's route lines come from the stop sequence instead
+    (`web._route_lines`), one per route: the longest variant covers every stop
+    its route's other variants call at, bar two on the 192 and two on the 53.
+    Learned data cannot help — `segment_stats` holds run *times* and carries no
+    coordinate. The only true road geometry available is the `observations`
+    breadcrumb trail, which would need real work to clean.
+21. **The map's CSP is wider than the board's was, deliberately.** Leaflet is far
+    too large to inline and hash, so `script-src`/`style-src` carry `'self'` —
+    which makes every route this server answers a candidate `<script src>`. The
+    JSON handlers therefore go through `web._json`, which sets `nosniff`, because
+    they carry operator free text (17). `img-src` names the tile origin and
+    nothing else, derived from `config.MAP_TILE_URL` by `web.tile_origin` so the
+    policy and the tile source cannot drift; `data:` is there only because
+    Leaflet swaps in a 1x1 data URI when it abandons a tile request.
+22. **Anything the server serves must be listed in `package-data`.** The image
+    installs the package, it does not copy the tree, so `static/vendor/*` had to
+    be added or the map would 404 in the container while working perfectly in a
+    checkout. A test walks `web.STATIC` against the globs rather than trusting
+    memory.
+23. **Frame the map on the stops, not the vehicles.** `BBOX` reaches ~20 minutes
+    upstream, so fitting the view to stops *and* buses zoomed out to the whole of
+    Greater Manchester and left the three watched stops an unreadable speck. Fit
+    the stops with `maxZoom: 14`, once, and never refit — re-fitting on a 10s
+    poll drags the map out from under anyone who panned it.
+24. **Bound anything that re-aggregates history.** `learn_segments` reads all of
     `stop_events` on every hourly pass while holding the write lock, and nothing
     used to delete from that table: 105ms at a month, 1.3s at a year, 4.4s and
     192MB at three. `trim_stop_events` caps it at `STOP_EVENT_RETAIN_DAYS` (90) and
@@ -137,8 +165,8 @@ lock held for 0.09s of it — the scan runs before a connection opens, which is 
 board no longer 502s nightly. Scan peak RSS 68MB, up from 62MB: the cost of reading
 in 1MB chunks. 4MB chunks measured no faster and 27MB worse. Cache 7.6MB · duty cycle
 <3% at a 15s poll · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured).
-Docker image 62.4MB (19.6MB gzipped; was 220MB), non-root, no pip/fastapi/pydantic.
-`nix develop` ~10s. 208 tests in ~4s.
+Docker image 62.7MB (was 62.4MB before Leaflet's 162KB), non-root, no
+pip/fastapi/pydantic. `nix develop` ~10s. 216 tests in ~4s.
 
 Matching 20 fixture vehicles: 3.35ms before memoisation, **2.00ms** after. Sharing one
 haversine per stop id already made the trigonometry cheap — 191 calls — but `_nearest`
