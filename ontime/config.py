@@ -68,6 +68,12 @@ HORIZON_SECS = int(os.getenv("ONTIME_HORIZON_SECS", "3600"))
 # derived before trimming and are kept permanently.
 RETAIN_DAYS = int(os.getenv("ONTIME_RETAIN_DAYS", "21"))
 
+# How long a statement waits for another process to release the write lock.
+# Five seconds was not enough: the timetable rebuild and the 15s poll loop both
+# write to the same database, and a rebuild's insert burst can outlast a short
+# timeout. Waiting is always better than failing a poll outright.
+BUSY_TIMEOUT_MS = int(os.getenv("ONTIME_BUSY_TIMEOUT_MS", "30000"))
+
 HOST = os.getenv("ONTIME_HOST", "127.0.0.1")
 PORT = int(os.getenv("ONTIME_PORT", "8000"))
 

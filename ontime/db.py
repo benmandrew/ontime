@@ -130,12 +130,18 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
     else:
         conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    if not readonly:
+        # Choosing a journal mode is itself a write, so this raises
+        # SQLITE_READONLY on a read-only handle to a database that is not
+        # already in WAL. The one read-only caller treats any error as "no
+        # usable cache" and rebuilds, so a database created in delete mode sent
+        # the maintenance loop into a rebuild it could never satisfy. The
+        # setting is persistent anyway: readers inherit it from the writer.
+        conn.execute("PRAGMA journal_mode=WAL")
     # Write-ahead logging keeps readers off the writer's back, but it does not
-    # help two writers, and the daily ingest holds the lock for well over a
-    # minute. Without a timeout SQLite gives up instantly, which is enough to
-    # fail every poll for the duration of the refresh.
-    conn.execute("PRAGMA busy_timeout=5000")
+    # help two writers. Without a timeout SQLite gives up instantly, which is
+    # enough to fail every poll while the rebuild commits.
+    conn.execute(f"PRAGMA busy_timeout={config.BUSY_TIMEOUT_MS}")
     return conn
 
 
