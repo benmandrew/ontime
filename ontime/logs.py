@@ -31,14 +31,35 @@ class UtcFormatter(logging.Formatter):
 
 
 class RedactFilter(logging.Filter):
-    """Remove the BODS key from any record before it reaches a handler."""
+    """Remove the BODS key from any record before it reaches a handler.
+
+    Every field a handler can end up printing is covered, not just the format
+    string: `log.error(exc)` puts the key in a non-str `msg`, and
+    `log.exception(...)` puts it in a traceback that no amount of care at the
+    call site would reach. A filter that only understood `str` messages was a
+    backstop that stopped exactly where the interesting leaks start.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         key = os.getenv("BODS_API_KEY", "").strip()
         if not key:
             return True
-        if isinstance(record.msg, str) and key in record.msg:
-            record.msg = record.msg.replace(key, "<redacted>")
+        if isinstance(record.msg, str):
+            if key in record.msg:
+                record.msg = record.msg.replace(key, "<redacted>")
+        elif key in str(record.msg):
+            # `log.error(RuntimeError(url))` — the key is invisible until the
+            # object is rendered, so render it here and keep the string.
+            record.msg = str(record.msg).replace(key, "<redacted>")
+        if record.exc_info and record.exc_text is None:
+            # The traceback is rendered by the formatter, which runs after
+            # every filter. Formatter.format reuses `exc_text` when it is
+            # already set, so pre-rendering it here is the only way in.
+            record.exc_text = logging.Formatter().formatException(record.exc_info)
+        if record.exc_text and key in record.exc_text:
+            record.exc_text = record.exc_text.replace(key, "<redacted>")
+        if isinstance(record.stack_info, str) and key in record.stack_info:
+            record.stack_info = record.stack_info.replace(key, "<redacted>")
         if record.args:
             if isinstance(record.args, dict):
                 record.args = {
@@ -53,19 +74,34 @@ class RedactFilter(logging.Filter):
         return True
 
 
+def _redact_everything_on(root: logging.Logger) -> None:
+    """Put the filter on every root handler, ours and anyone else's.
+
+    A handler left by someone else's `basicConfig` — a dependency's, or code
+    that ran before this — keeps receiving every record in parallel with ours,
+    and would write them out unredacted. Removing it instead would be simpler
+    and ruder: it is not ours to throw away, and doing so silently breaks
+    anything that installed a handler on purpose.
+    """
+    for h in root.handlers:
+        if not any(isinstance(f, RedactFilter) for f in h.filters):
+            h.addFilter(RedactFilter())
+
+
 def setup(level: str | int | None = None) -> None:
     """Configure root logging. Safe to call more than once."""
     root = logging.getLogger()
     if any(getattr(h, "_ontime", False) for h in root.handlers):
+        _redact_everything_on(root)
         return
 
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(UtcFormatter(FORMAT, DATEFMT))
-    handler.addFilter(RedactFilter())
     handler._ontime = True  # type: ignore[attr-defined]
 
     root.handlers = [h for h in root.handlers if not getattr(h, "_ontime", False)]
     root.addHandler(handler)
+    _redact_everything_on(root)
     root.setLevel(level or os.getenv("ONTIME_LOG_LEVEL", "INFO").upper())
 
     # uvicorn installs its own handlers; route them through ours instead.
