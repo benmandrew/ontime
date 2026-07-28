@@ -13,6 +13,11 @@
     /* Route lines need to win against OpenStreetMap's own palette, which has
        already spent orange and yellow on A-roads and blue on water. */
     --route: #a78bfa;
+    /* The tiles are the one part of the map that is not ours to colour: they
+       arrive as raster PNGs drawn for a white page. Inverting them and rotating
+       the hue back flips the lightness while leaving that palette recognisable
+       — roads still orange, water still blue, both now dark. */
+    --tile-filter: invert(1) hue-rotate(180deg) brightness(.92) contrast(.9);
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -20,6 +25,7 @@
       --ink: #14161b; --dim: #5f6672; --accent: #b4700a;
       --live: #15803d; --late: #b91c1c; --sched: #6b7280;
       --route: #6d28d9;
+      --tile-filter: none;
     }
   }
   * { box-sizing: border-box; }
@@ -57,6 +63,10 @@
   .mapcard .sub { padding: 0 .9rem .6rem; color: var(--dim); font-size: .75rem; }
   #map { height: 26rem; width: 100%; border-top: 1px solid var(--line); background: var(--panel); }
   .leaflet-container { background: var(--panel); font: inherit; }
+  /* On the tile pane alone. Everything we draw — pins, buses, route lines —
+     sits in a pane above it and keeps the colours set here rather than being
+     inverted along with the basemap. */
+  .leaflet-tile-pane { filter: var(--tile-filter); }
   /* Route lines are Leaflet paths given a className, so they are themed here
      rather than by passing literal colours to the plugin. Two strokes: a wide
      pale casing under a narrower core, which is how the basemap draws its own

@@ -140,7 +140,10 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     they carry operator free text (17). `img-src` names the tile origin and
     nothing else, derived from `config.MAP_TILE_URL` by `web.tile_origin` so the
     policy and the tile source cannot drift; `data:` is there only because
-    Leaflet swaps in a 1x1 data URI when it abandons a tile request.
+    Leaflet swaps in a 1x1 data URI when it abandons a tile request. The dark
+    basemap is that same origin filtered — `--tile-filter` inverts the tile pane
+    and rotates the hue back — not a second, darker tile provider, which would
+    mean another host in `img-src` and another party's attribution.
 22. **Anything the server serves must be listed in `package-data`.** The image
     installs the package, it does not copy the tree, so `static/vendor/*` had to
     be added or the map would 404 in the container while working perfectly in a
