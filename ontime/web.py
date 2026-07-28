@@ -17,12 +17,13 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from . import config, db, eta, history, locking, logs, siri
+from . import config, db, eta, history, locking, logs, segments, siri
 from .matching import LONDON, Trip, load_trips, match
 
 STATIC = Path(__file__).parent / "static"
@@ -361,6 +362,40 @@ async def api_map(_request: Request) -> JSONResponse:
     )
 
 
+# The report re-reads the whole of `stop_events` and the whole timetable, which
+# is a second or two once the retention window is full — far too long to spend
+# on the event loop, where it would stall the board poll for every viewer. It is
+# also answering a question about an hourly batch job, so serving a slightly old
+# copy costs nothing. Hence: off-thread, and cached for longer than a glance.
+_SEGMENTS_TTL = 300.0
+_segments_cache: tuple[float, dict] | None = None
+
+
+def _segments_report() -> dict:
+    global _segments_cache
+    now = datetime.now(UTC).timestamp()
+    if _segments_cache and now - _segments_cache[0] < _SEGMENTS_TTL:
+        return _segments_cache[1]
+    conn = db.connect(readonly=True)
+    try:
+        report = segments.build(conn)
+    finally:
+        conn.close()
+    report["age_secs"] = 0
+    _segments_cache = (now, report)
+    return report
+
+
+async def api_segments(_request: Request) -> JSONResponse:
+    report = await run_in_threadpool(_segments_report)
+    if _segments_cache:
+        report = {
+            **report,
+            "age_secs": round(datetime.now(UTC).timestamp() - _segments_cache[0]),
+        }
+    return _json(report)
+
+
 async def healthz(_request: Request) -> JSONResponse:
     """Liveness for the container healthcheck and for `tailscale serve` probes."""
     fresh = state.board.get("updated") is not None and datetime.now(
@@ -448,6 +483,13 @@ def content_security_policy(html: str) -> str:
 DASHBOARD = STATIC / "dashboard.html"
 CSP = content_security_policy(DASHBOARD.read_text())
 
+# Hashes are per-file, so the second page needs its own policy computed from
+# its own body. It loads no vendored script, but `content_security_policy`
+# is shared with the board deliberately: two hand-tuned policies would drift,
+# and the looser of them would be the one nobody was watching.
+SEGMENTS_PAGE = STATIC / "segments.html"
+SEGMENTS_CSP = content_security_policy(SEGMENTS_PAGE.read_text())
+
 NOSNIFF = {"X-Content-Type-Options": "nosniff"}
 
 # Leaflet 1.9.4, vendored rather than pulled from a CDN. The page names no
@@ -489,6 +531,13 @@ async def index(_request: Request) -> FileResponse:
     )
 
 
+async def segments_page(_request: Request) -> FileResponse:
+    return FileResponse(
+        SEGMENTS_PAGE,
+        headers={"Content-Security-Policy": SEGMENTS_CSP, **NOSNIFF},
+    )
+
+
 # Starlette rather than FastAPI. Nothing here uses a FastAPI feature — no
 # request models, no dependency injection, no generated schema — and the
 # pydantic it pulls in was 8.6MB of a 14MB virtualenv, as well as the only
@@ -496,10 +545,12 @@ async def index(_request: Request) -> FileResponse:
 app = Starlette(
     routes=[
         Route("/", index),
+        Route("/segments", segments_page),
         Route("/vendor/{name}", vendor),
         Route("/api/board", api_board),
         Route("/api/map", api_map),
         Route("/api/stops", api_stops),
+        Route("/api/segments", api_segments),
         Route("/healthz", healthz),
     ],
     lifespan=lifespan,

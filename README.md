@@ -14,6 +14,22 @@ Route lines are drawn through each route's stop sequence. That is not the geomet
 
 The basemap is the one part of this application that talks to a third party. Tiles load directly from the tile server named in `ONTIME_MAP_TILE_URL`, and the page's *Content Security Policy* (CSP) permits that origin and no other; `web.tile_origin` derives the policy from the same setting, so the two cannot drift apart. Leaflet 1.9.4 is vendored under `ontime/static/vendor/` rather than loaded from a content delivery network, which costs 162KB in the image and removes a remote dependency from a dashboard that has to work when something else is down.
 
+## Which segments are learned
+
+Learned traversal times are the part of this project that improves with age, and the part hardest to inspect. `segment_stats` holds three numbers per *segment* — a median, an 85th percentile, and a sample count — keyed on the route, the two stops, the local hour, and whether the day falls at a weekend. `eta.predict` consults a row only once it holds five samples; below that the timetabled gap stands in. But three numbers cannot say whether five samples are enough, and the threshold is the whole of the model's notion of confidence.
+
+`/segments` answers that question separately. It rebuilds the sample vectors the learner was fitted to, rather than reading the summary rows, so the page and the running model cannot drift apart.
+
+Uncertainty on each median is reported as a *distribution-free* interval, taken from order statistics instead of an assumed shape. Traversal times are not normal: the road bounds them below and traffic does not bound them above. The widest interval n samples can offer is the whole observed range, which covers the true median with probability 1 − 2/2ⁿ. That first clears 95% at n = 6. A segment sitting exactly on the five-sample threshold therefore has no 95% interval at any width — the gate is one observation short of the smallest sample that could support the claim.
+
+Two further counts come from comparing the learned buckets against the timetable rather than against each other. Coverage measures the segments observed at least once against every segment the timetable implies, which is 6,771 buckets across the seven watched routes.
+
+The second count came out of a defect the page found on its first run. A run holds only the stops that were detected, so when one goes unobserved the events either side of it sit next to each other in the list while being two stops apart on the road. `learn_segments` paired them regardless, recording a traversal across the missed stop — a bucket keyed on two stops no trip runs consecutively, which `eta.predict` then never looks up, because it builds its keys by walking the scheduled sequence. On one day of real data that was 263 of 484 buckets. The duration guard was meant to catch exactly this, and cannot: a skipped hop between two closely spaced stops lands comfortably inside the five-second to thirty-minute window. Pairing now requires the two events to be adjacent in the trip's stop sequence, which removed all 263 and changed the samples of no bucket the predictor reads.
+
+What remains is the honest version of the same measurement, and the page reports it as *skipped*: hops that could not be measured because a stop between two detections went unseen. That is a gap in watching rather than in the timetable, and it is the one input to the model nothing else on the page describes.
+
+The page is deliberately unflattering. A dashboard reporting how much it has learned should make the shortfall the easiest thing on it to read.
+
 ## Running it
 
 The Nix flake pins the toolchain, so `direnv allow` is the only setup step. A free key takes a minute to register at [data.bus-data.dft.gov.uk](https://data.bus-data.dft.gov.uk/account/signup/).
@@ -62,9 +78,10 @@ ontime/ingest.py       GTFS download and cache build
 ontime/siri.py         feed fetch and parse
 ontime/matching.py     vehicle to trip matching
 ontime/history.py      observation storage and segment learning
+ontime/segments.py     what the learned model knows, and how firmly
 ontime/eta.py          arrival prediction
 ontime/web.py          poller and HTTP API
-ontime/static/         the dashboard page and vendored Leaflet
+ontime/static/         the dashboard pages and vendored Leaflet
 ontime/maintenance.py  periodic refresh loop
 ```
 

@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ontime — learned segments</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --ink: #e8eaf0; --dim: #939aab; --accent: #ffd166;
+    --live: #4ade80; --late: #f87171; --sched: #64748b;
+    /* Not on the board: the skipped counter is neither good news nor an
+       error, and borrowing --late for it would read as a delay. */
+    --warn: #fb923c;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f5f6f8; --panel: #ffffff; --line: #e2e5ea;
+      --ink: #14161b; --dim: #5f6672; --accent: #b4700a;
+      --live: #15803d; --late: #b91c1c; --sched: #6b7280;
+      --warn: #c2410c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.25rem; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  h1 { font-size: 1.15rem; margin: 0; letter-spacing: .01em; }
+  .meta { color: var(--dim); font-size: .8rem; }
+  a { color: var(--accent); }
+  a:hover { color: var(--ink); }
+  section { margin-bottom: 1rem; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .card h2 { font-size: .95rem; margin: 0; padding: .7rem .9rem .15rem; }
+  .card .sub { padding: 0 .9rem .6rem; color: var(--dim); font-size: .75rem; }
+  .card .body { padding: .2rem .9rem .9rem; }
+  .card .body p { margin: .5rem 0 0; color: var(--dim); font-size: .78rem; max-width: 62rem; }
+  .card .body p b { color: var(--ink); font-weight: 600; }
+  /* The funnel. One cell per stage, each carrying the rule it applies, so the
+     attrition is readable without a legend. */
+  .funnel { display: grid; gap: .6rem; padding: .2rem .9rem .9rem;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); }
+  .stage { border: 1px solid var(--line); border-radius: 8px; padding: .55rem .7rem; }
+  .stage .n { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums;
+              line-height: 1.1; display: block; }
+  .stage .k { font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+              color: var(--dim); font-weight: 600; }
+  .stage .why { font-size: .72rem; color: var(--dim); margin-top: .25rem; }
+  .stage.warn { border-color: var(--warn); }
+  .stage.warn .n { color: var(--warn); }
+  .stage.gate .n { color: var(--live); }
+  .arrowrow { color: var(--dim); font-size: .72rem; padding: 0 .9rem .8rem; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-size: .68rem; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); font-weight: 600; padding: .4rem .9rem; border-top: 1px solid var(--line); }
+  td { padding: .42rem .9rem; border-top: 1px solid var(--line); vertical-align: baseline; }
+  tr:hover td { background: rgba(127,127,127,.07); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--ink); }
+  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .route { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .late { color: var(--late); } .early { color: var(--live); }
+  .muted { color: var(--dim); }
+  .empty { padding: .9rem; color: var(--dim); font-size: .85rem; }
+  .err { background: #7f1d1d; color: #fff; padding: .5rem .8rem; border-radius: 8px; margin-bottom: .8rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; }
+  .tag { font-size: .62rem; text-transform: uppercase; letter-spacing: .05em;
+         padding: .08rem .34rem; border-radius: 4px; border: 1px solid currentColor;
+         white-space: nowrap; }
+  .t-unreach { color: var(--warn); }
+  tr.unused td { color: var(--dim); }
+  /* Bars and the chart are SVG, not styled divs: a data-driven width has to be
+     a geometry attribute, because a hash-based policy cannot cover an inline
+     style attribute and the page carries none. */
+  .bar { display: block; width: 100%; height: .5rem; }
+  .bar-track { fill: var(--line); }
+  .bar-fill { fill: var(--accent); }
+  .bar-used { fill: var(--live); }
+  .minibar { display: block; width: 6rem; height: .4rem; }
+  .covline { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+             font-variant-numeric: tabular-nums; margin-bottom: .35rem; }
+  .covline .big { font-size: 1.5rem; font-weight: 700; }
+  .chart { display: block; width: 100%; height: auto; }
+  .ax { stroke: var(--line); stroke-width: 1; }
+  .axlabel { fill: var(--dim); font-size: 11px; }
+  .barlabel { fill: var(--dim); font-size: 10px; }
+  .b-below { fill: var(--sched); }
+  .b-above { fill: var(--live); }
+  .zone { fill: var(--sched); opacity: .1; }
+  .thr { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .thr2 { stroke: var(--live); stroke-width: 1.5; stroke-dasharray: 4 3; }
+  .thrlabel { fill: var(--accent); font-size: 11px; }
+  .thrlabel2 { fill: var(--live); font-size: 11px; }
+  .filters { display: flex; gap: .9rem; align-items: center; flex-wrap: wrap;
+             padding: .2rem .9rem .7rem; font-size: .8rem; color: var(--dim); }
+  .filters input[type=text] {
+    background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+    border-radius: 6px; padding: .3rem .5rem; font: inherit; min-width: 15rem;
+  }
+  .filters label { display: flex; align-items: center; gap: .3rem; cursor: pointer; }
+  .scroll { max-height: 34rem; overflow: auto; border-top: 1px solid var(--line); }
+  footer { margin-top: 1.1rem; color: var(--dim); font-size: .75rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ontime — learned segments</h1>
+  <span class="meta" id="meta">loading…</span>
+  <span class="meta"><a href="/">back to the board</a></span>
+</header>
+<div id="err"></div>
+
+<section class="card">
+  <h2>The funnel</h2>
+  <div class="sub">A segment is one (route, from-stop, to-stop, hour, weekday/weekend) bucket.
+    Seeing one is not the same as knowing it, and knowing it is not the same as being able
+    to say so with any confidence. Each step below drops what the next one cannot use.</div>
+  <div class="funnel" id="funnel"></div>
+  <div class="arrowrow" id="funnelnote"></div>
+</section>
+
+<section class="card">
+  <h2>Coverage</h2>
+  <div class="sub">Measured against the timetable, not against what happened to be observed:
+    the denominator is every segment-bucket the cached schedule implies, so this is how much
+    of the model is still missing rather than how much of the traffic was caught.</div>
+  <div class="body" id="coverage"></div>
+  <table id="routes"><tbody></tbody></table>
+</section>
+
+<section class="card">
+  <h2>How many samples each segment has</h2>
+  <div class="sub">The mass of what has been learned, and where the gates fall across it.</div>
+  <div class="body">
+    <svg class="chart" id="hist" viewBox="0 0 720 280" preserveAspectRatio="xMidYMid meet"
+         role="img" aria-label="Segments by sample count"></svg>
+    <p>The confidence interval on a segment's median is distribution-free: it is built from
+      the order statistics of the raw samples — the k-th smallest observation and the k-th
+      largest — so it assumes nothing about the shape of the traversal-time distribution,
+      which is not normal and could not be treated as such (bounded below by the road,
+      unbounded above by traffic). The freedom costs something at the bottom of the range.
+      The widest interval those statistics can offer is the full observed spread,
+      <b>min to max</b>, and even that covers the true median only with probability
+      <b>1 − 2/2ⁿ</b>. That expression first reaches 95% at <b>n = 6</b>. So at five
+      samples — exactly the threshold the predictor uses — there is no 95% interval at any
+      width: not a wide one, none. The gate sits one observation short of the smallest
+      sample that could support the claim being made on it.</p>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Every segment observed</h2>
+  <div class="sub">Click a column to sort. Times are the observed traversal from the first
+    stop to the second; <em>Timetable</em> is what the schedule allows for the same gap.</div>
+  <div class="filters">
+    <input type="text" id="q" placeholder="filter by route or stop name" autocomplete="off">
+    <label><input type="checkbox" id="onlyused"> only ones the predictor uses</label>
+    <span id="count"></span>
+  </div>
+  <div class="scroll">
+    <table id="segs"><thead></thead><tbody></tbody></table>
+  </div>
+</section>
+
+<footer id="foot"></footer>
+
+<script>
+// Stop names and route names are operator free text that the server passes
+// through untouched, and every one of them lands in innerHTML below. Escaping
+// here is the only thing between a hostile name in the timetable feed and
+// markup running in this page; the policy the server sets is the second line.
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
+const num = n => Number(n ?? 0).toLocaleString('en-GB');
+const pct = (a, b) => b ? (100 * a / b) : 0;
+const pct1 = (a, b) => pct(a, b).toFixed(1) + '%';
+
+// `1m 05s` above a minute, `45s` below it. Null is not zero — a segment with no
+// scheduled counterpart has no timetable gap, which is a different statement
+// from one allowed no time at all.
+function secs(v) {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—';
+  const t = Math.round(Number(v));
+  const a = Math.abs(t);
+  if (a < 60) return a + 's';
+  return Math.floor(a / 60) + 'm ' + String(a % 60).padStart(2, '0') + 's';
+}
+
+function signedSecs(v) {
+  if (v === null || v === undefined || !Number.isFinite(Number(v))) return '—';
+  const t = Math.round(Number(v));
+  return (t > 0 ? '+' : t < 0 ? '−' : '') + secs(t);
+}
+
+const hourLabel = h => String(h).padStart(2, '0') + ':00';
+
+let DATA = null;
+let sortKey = 'n';
+let sortDir = -1;
+// Several thousand rows is more than anyone reads and enough to make sorting
+// feel slow. The filter is the way through them, so say plainly when the list
+// has been cut rather than silently showing a prefix.
+const RENDER_LIMIT = 500;
+
+// ---- 1. The funnel ----------------------------------------------------------
+function renderFunnel(d) {
+  const t = d.totals, g = d.gate;
+  const stages = [
+    ['observed', t.observed, 'segments seen at all', 'any run-time measured between two stops', ''],
+    ['stored', t.stored, 'n ≥ ' + g.store_floor, 'what <code>segment_stats</code> keeps on disk', ''],
+    ['used', t.used, 'n ≥ ' + g.min_samples, 'what the predictor will actually consult', 'gate'],
+    ['significant', t.significant, 'n ≥ ' + g.confident_n,
+     'where a 95% interval for the median exists at any width', 'gate'],
+  ];
+  let html = stages.map(([k, v, rule, why, cls]) => `
+    <div class="stage ${cls}">
+      <span class="k">${esc(k)}</span>
+      <span class="n">${num(v)}</span>
+      <div class="why">${esc(rule)}<br>${why}</div>
+    </div>`).join('');
+  const attempts = t.paired + t.skipped;
+  html += `
+    <div class="stage warn">
+      <span class="k">skipped</span>
+      <span class="n">${num(t.skipped)}</span>
+      <div class="why">hops refused, of ${num(attempts)}<br>
+        the stop between the two detections was never seen, so how long that
+        hop took is not recoverable from the run</div>
+    </div>`;
+  document.getElementById('funnel').innerHTML = html;
+
+  const t2 = d.totals;
+  let note =
+    `${num(t2.observed)} observed → ${num(t2.stored)} stored (${pct1(t2.stored, t2.observed)}) ` +
+    `→ ${num(t2.used)} used (${pct1(t2.used, t2.observed)}) ` +
+    `→ ${num(t2.significant)} with a 95% interval (${pct1(t2.significant, t2.observed)}). `;
+  note += attempts
+    ? `Separately, ${num(t2.skipped)} of ${num(attempts)} adjacent-stop hops ` +
+      `(${pct1(t2.skipped, attempts)}) could not be measured because a stop between two ` +
+      `detections went unobserved. That is a gap in watching, not in the timetable: it is ` +
+      `what the poller missed while the bus was moving.`
+    : 'No hops have been measured yet.';
+  if (t2.unreachable) {
+    note += ` ${num(t2.unreachable)} learned segments pair two stops no trip runs ` +
+      `consecutively, which should not happen and means a bucket is being learned that ` +
+      `the predictor can never look up.`;
+  }
+  document.getElementById('funnelnote').innerHTML = note;
+}
+
+// ---- 2. Coverage ------------------------------------------------------------
+// A bar is an SVG rect whose width is a geometry attribute. A div child with a
+// width would need an inline style attribute, which no CSP hash can cover.
+function barSVG(cls, fracs) {
+  const rects = fracs.map(([c, f]) =>
+    `<rect class="${c}" x="0" y="0" height="10" width="${(100 * Math.max(0, Math.min(1, f))).toFixed(3)}"/>`
+  ).join('');
+  return `<svg class="${cls}" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true">
+      <rect class="bar-track" x="0" y="0" width="100" height="10"/>${rects}</svg>`;
+}
+
+function renderCoverage(d) {
+  const t = d.totals;
+  document.getElementById('coverage').innerHTML = `
+    <div class="covline">
+      <span class="big">${pct1(t.covered, t.scheduled_cells)}</span>
+      <span class="muted">${num(t.covered)} of ${num(t.scheduled_cells)} scheduled
+        segment-buckets have any observation at all</span>
+    </div>
+    ${barSVG('bar', [['bar-fill', pct(t.covered, t.scheduled_cells) / 100]])}
+    <p>Built from ${num(t.stop_events)} stop events over ${num(t.history_days)}
+      ${t.history_days === 1 ? 'day' : 'days'} of history, which is trimmed at
+      ${num(d.gate.retain_days)} days — so this is a rolling window, not an accumulation.</p>`;
+
+  // Worst first: a route with nothing seen is the finding, and sorting by name
+  // would bury it among routes that merely have thin coverage.
+  const routes = (d.routes || []).slice().sort((a, b) =>
+    pct(a.seen, a.scheduled) - pct(b.seen, b.scheduled) || b.scheduled - a.scheduled);
+
+  document.getElementById('routes').innerHTML = `
+    <thead><tr>
+      <th>Route</th><th class="num">Scheduled</th><th class="num">Seen</th>
+      <th class="num">Used</th><th class="num">Coverage</th><th></th>
+    </tr></thead>
+    <tbody>${routes.map(r => `
+      <tr${r.seen ? '' : ' class="unused"'}>
+        <td class="route">${esc(r.route)}</td>
+        <td class="num">${num(r.scheduled)}</td>
+        <td class="num">${num(r.seen)}</td>
+        <td class="num">${num(r.used)}</td>
+        <td class="num">${r.scheduled ? pct1(r.seen, r.scheduled) : '—'}</td>
+        <td>${barSVG('minibar', [
+          ['bar-fill', pct(r.seen, r.scheduled) / 100],
+          ['bar-used', pct(r.used, r.scheduled) / 100],
+        ])}</td>
+      </tr>`).join('')}</tbody>`;
+}
+
+// ---- 3. The sample-count histogram -----------------------------------------
+function renderHistogram(d) {
+  const g = d.gate;
+  const hist = d.histogram || [];
+  const svg = document.getElementById('hist');
+  if (!hist.length) {
+    svg.innerHTML = '<text class="axlabel" x="12" y="24">No segments observed yet.</text>';
+    return;
+  }
+  const L = 48, R = 14, T = 46, B = 42;
+  const W = 720, H = 280, pw = W - L - R, ph = H - T - B;
+  const counts = new Map(hist.map(h => [h.n, h.segments]));
+  // The axis runs past the confidence gate even when nothing reaches it: the
+  // point of the chart is that the gates sit beyond the data, and an axis that
+  // stopped at the tallest bar would hide both lines.
+  const nMax = Math.max(...hist.map(h => h.n), g.confident_n + 1);
+  const maxC = Math.max(...hist.map(h => h.segments));
+  const band = pw / nMax;
+  const x = n => L + (n - 1) * band;
+  const y = c => T + ph - (maxC ? (c / maxC) * ph : 0);
+
+  const parts = [];
+  // The region below the predictor's gate, shaded — everything in it is learning
+  // that exists and is never consulted.
+  parts.push(`<rect class="zone" x="${L.toFixed(1)}" y="${T}" ` +
+    `width="${Math.max(0, x(g.min_samples) - L).toFixed(1)}" height="${ph}"/>`);
+
+  // y gridlines and labels.
+  for (let i = 0; i <= 4; i++) {
+    const c = maxC * i / 4, yy = y(c);
+    parts.push(`<line class="ax" x1="${L}" y1="${yy.toFixed(1)}" x2="${L + pw}" y2="${yy.toFixed(1)}"/>`);
+    parts.push(`<text class="axlabel" x="${L - 6}" y="${(yy + 4).toFixed(1)}" text-anchor="end">${num(Math.round(c))}</text>`);
+  }
+
+  const step = nMax <= 24 ? 1 : Math.ceil(nMax / 24);
+  for (let n = 1; n <= nMax; n++) {
+    const c = counts.get(n) || 0;
+    if (c > 0) {
+      const h = Math.max(2, T + ph - y(c));
+      const cls = n >= g.min_samples ? 'b-above' : 'b-below';
+      parts.push(`<rect class="${cls}" x="${(x(n) + band * 0.15).toFixed(1)}" ` +
+        `y="${(T + ph - h).toFixed(1)}" width="${Math.max(1, band * 0.7).toFixed(1)}" ` +
+        `height="${h.toFixed(1)}"/>`);
+      parts.push(`<text class="barlabel" x="${(x(n) + band * 0.5).toFixed(1)}" ` +
+        `y="${(T + ph - h - 4).toFixed(1)}" text-anchor="middle">${num(c)}</text>`);
+    }
+    if (n % step === 0 || n === 1) {
+      parts.push(`<text class="axlabel" x="${(x(n) + band * 0.5).toFixed(1)}" ` +
+        `y="${T + ph + 16}" text-anchor="middle">${n}</text>`);
+    }
+  }
+
+  parts.push(`<line class="ax" x1="${L}" y1="${T + ph}" x2="${L + pw}" y2="${T + ph}"/>`);
+  parts.push(`<text class="axlabel" x="${(L + pw / 2).toFixed(1)}" y="${H - 8}" ` +
+    `text-anchor="middle">samples per segment (n)</text>`);
+  // Anchored from the left edge, not from the axis: right-anchoring it at
+  // L - 6 ran the word off the viewBox, since L is only wide enough for the
+  // tick numbers themselves.
+  parts.push(`<text class="axlabel" x="0" y="${T - 10}" text-anchor="start">segments</text>`);
+
+  // The two gates, one band apart, so their labels are stacked rather than set
+  // side by side where they would collide.
+  [[g.min_samples, 'thr', 'thrlabel', 'n = ' + g.min_samples + ' · used by the predictor', 16],
+   [g.confident_n, 'thr2', 'thrlabel2', 'n = ' + g.confident_n + ' · 95% CI possible', 32],
+  ].forEach(([n, lineCls, textCls, label, ly]) => {
+    const xx = x(n);
+    parts.push(`<line class="${lineCls}" x1="${xx.toFixed(1)}" y1="${ly - 8}" ` +
+      `x2="${xx.toFixed(1)}" y2="${T + ph}"/>`);
+    const right = xx > L + pw * 0.6;
+    parts.push(`<text class="${textCls}" x="${(xx + (right ? -6 : 6)).toFixed(1)}" y="${ly}" ` +
+      `text-anchor="${right ? 'end' : 'start'}">${esc(label)}</text>`);
+  });
+
+  svg.innerHTML = parts.join('');
+}
+
+// ---- 4. The segment table ---------------------------------------------------
+const COLS = [
+  { key: 'route', label: 'Route', num: false },
+  { key: 'from_name', label: 'From → To', num: false },
+  { key: 'hour', label: 'Hour', num: true },
+  { key: 'is_weekend', label: 'Day', num: false },
+  { key: 'n', label: 'n', num: true },
+  { key: 'median', label: 'Median', num: true },
+  { key: 'spread', label: 'Spread', num: true },
+  { key: 'ci_conf', label: '95% CI', num: true },
+  { key: 'sched_secs', label: 'Timetable', num: true },
+  { key: 'delta_secs', label: 'Δ', num: true },
+];
+
+function sortValue(s, key) {
+  if (key === 'spread') return Number(s.max) - Number(s.min);
+  return s[key];
+}
+
+function compare(a, b) {
+  const va = sortValue(a, sortKey), vb = sortValue(b, sortKey);
+  // Nulls sink in both directions: an absent value is not a small one, and
+  // letting it float to the top on a descending sort would say it was.
+  const na = va === null || va === undefined, nb = vb === null || vb === undefined;
+  if (na || nb) return na && nb ? 0 : na ? 1 : -1;
+  if (typeof va === 'string' || typeof vb === 'string') {
+    return sortDir * String(va).localeCompare(String(vb), 'en-GB');
+  }
+  return sortDir * (Number(va) - Number(vb)) || (b.n - a.n);
+}
+
+function filtered() {
+  const q = document.getElementById('q').value.trim().toLowerCase();
+  const onlyUsed = document.getElementById('onlyused').checked;
+  return (DATA.segments || []).filter(s => {
+    if (onlyUsed && !s.used) return false;
+    if (!q) return true;
+    return (s.route + ' ' + s.from_name + ' ' + s.to_name).toLowerCase().includes(q);
+  });
+}
+
+function ciCell(s) {
+  if (s.ci_conf === null || s.ci_conf === undefined) {
+    return `<span class="muted">— n &lt; ${esc(DATA.gate.confident_n)}</span>`;
+  }
+  return `${esc(secs(s.ci_lo))}–${esc(secs(s.ci_hi))} ` +
+    `<span class="muted">${(100 * s.ci_conf).toFixed(1)}%</span>`;
+}
+
+function deltaCell(s) {
+  if (s.delta_secs === null || s.delta_secs === undefined) return '<span class="muted">—</span>';
+  const cls = s.delta_secs < 0 ? 'early' : s.delta_secs > 0 ? 'late' : 'muted';
+  return `<span class="${cls}">${esc(signedSecs(s.delta_secs))}</span>`;
+}
+
+function renderTable() {
+  const rows = filtered().sort(compare);
+  const shown = rows.slice(0, RENDER_LIMIT);
+  const total = (DATA.segments || []).length;
+
+  document.querySelector('#segs thead').innerHTML = '<tr>' + COLS.map(c =>
+    `<th class="sortable${c.num ? ' num' : ''}" data-key="${esc(c.key)}">${esc(c.label)}` +
+    `${c.key === sortKey ? (sortDir < 0 ? ' ↓' : ' ↑') : ''}</th>`).join('') + '</tr>';
+
+  document.querySelector('#segs tbody').innerHTML = shown.length ? shown.map(s => `
+    <tr class="${s.used ? '' : 'unused'}">
+      <td class="route">${esc(s.route)}</td>
+      <td>${esc(s.from_name)} → ${esc(s.to_name)}
+        ${s.reachable ? '' : '<span class="tag t-unreach" title="These two stops are never ' +
+          'adjacent in the timetable, so the predictor has no key that could look this ' +
+          'segment up. The learner refuses these, so seeing one here is a bug.">unreachable</span>'}</td>
+      <td class="num">${esc(hourLabel(s.hour))}</td>
+      <td>${s.is_weekend ? 'Weekend' : 'Weekday'}</td>
+      <td class="num">${num(s.n)}</td>
+      <td class="num">${esc(secs(s.median))}</td>
+      <td class="num">${esc(secs(s.min))}–${esc(secs(s.max))}</td>
+      <td class="num">${ciCell(s)}</td>
+      <td class="num">${esc(secs(s.sched_secs))}</td>
+      <td class="num">${deltaCell(s)}</td>
+    </tr>`).join('') : '<tr><td class="empty" colspan="10">Nothing matches that filter.</td></tr>';
+
+  document.getElementById('count').textContent =
+    `showing ${num(shown.length)}` +
+    (rows.length > shown.length ? ` of ${num(rows.length)} matching (list truncated — narrow the filter)` :
+      ` of ${num(total)} segments`);
+}
+
+function bindTable() {
+  document.querySelector('#segs thead').addEventListener('click', ev => {
+    const th = ev.target.closest('th[data-key]');
+    if (!th) return;
+    const key = th.dataset.key;
+    if (key === sortKey) sortDir = -sortDir;
+    else { sortKey = key; sortDir = (key === 'route' || key === 'from_name' || key === 'is_weekend') ? 1 : -1; }
+    renderTable();
+  });
+  ['q', 'onlyused'].forEach(id =>
+    document.getElementById(id).addEventListener('input', renderTable));
+}
+
+// ---- Load -------------------------------------------------------------------
+function render(d) {
+  DATA = d;
+  renderFunnel(d);
+  renderCoverage(d);
+  renderHistogram(d);
+  renderTable();
+
+  const t = d.totals, g = d.gate;
+  document.getElementById('meta').textContent =
+    `computed ${num(Math.round(d.age_secs || 0))}s ago · ` +
+    `${num(t.observed)} segments observed, ${num(t.used)} above the gate`;
+  document.getElementById('foot').textContent =
+    `Gate: the predictor consults a segment at n ≥ ${g.min_samples}; ` +
+    `segment_stats stores one at n ≥ ${g.store_floor}; a ` +
+    `${(100 * g.target_conf).toFixed(0)}% interval for the median first exists at ` +
+    `n ≥ ${g.confident_n}. Derived stop events are retained ${g.retain_days} days, so ` +
+    `these counts describe a rolling window rather than everything ever seen.`;
+}
+
+async function load() {
+  try {
+    const r = await fetch('/api/segments');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    render(await r.json());
+  } catch (e) {
+    document.getElementById('err').innerHTML =
+      '<div class="err">Could not load /api/segments. The report is rebuilt on request ' +
+      'and can take a moment on a cold database; reload to try again.</div>';
+    document.getElementById('meta').textContent = 'no data';
+  }
+}
+
+bindTable();
+load();
+</script>
+</body>
+</html>

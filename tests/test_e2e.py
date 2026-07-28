@@ -61,6 +61,9 @@ def live_app(data_dir, feed, api_key, monkeypatch):
     shutil.copy(MINI_GTFS, config.GTFS_ZIP)
     ingest.build()
     monkeypatch.setattr(web, "state", web.State())
+    # The segments report is cached in a module global, which outlives the
+    # temporary database it was built from.
+    monkeypatch.setattr(web, "_segments_cache", None)
     return feed
 
 
@@ -367,7 +370,8 @@ class TestHttpApi:
             assert "HTTPSConnectionPool" not in text
         assert "/data/ontime.sqlite" in caplog.text, "the detail must survive in the log"
 
-    def test_the_page_locks_itself_down_with_a_policy_it_satisfies(self, live_app):
+    @pytest.mark.parametrize("path", ("/", "/segments"))
+    def test_the_page_locks_itself_down_with_a_policy_it_satisfies(self, live_app, path):
         """An escaping slip should not be one bug away from script execution.
 
         A policy that allowed 'unsafe-inline' would be decoration, since that
@@ -375,15 +379,19 @@ class TestHttpApi:
         page ships with permits those two and nothing else. Recomputed here
         from the served body, because a policy the page cannot satisfy is a
         blank screen.
+
+        Every page the server serves is checked, not just the board: hashes are
+        per-file, so a second page means a second policy, and a second policy is
+        somewhere for a weaker one to hide.
         """
         with TestClient(web.app) as client:
-            r = client.get("/")
+            r = client.get(path)
         csp = r.headers["content-security-policy"]
 
         assert "default-src 'none'" in csp
         assert "'unsafe-inline'" not in csp, "a hash source is ignored beside it"
         assert "frame-ancestors 'none'" in csp
-        assert "connect-src 'self'" in csp, "the page polls its own /api/board"
+        assert "connect-src 'self'" in csp, "the page fetches from its own origin"
 
         for tag in ("script", "style"):
             blocks = re.findall(rf"<{tag}>(.*?)</{tag}>", r.text, re.DOTALL)
@@ -461,7 +469,13 @@ class TestHttpApi:
         browser will not second-guess.
         """
         with TestClient(web.app) as client:
-            for path in ("/api/board", "/api/map", "/api/stops", "/healthz"):
+            for path in (
+                "/api/board",
+                "/api/map",
+                "/api/stops",
+                "/api/segments",
+                "/healthz",
+            ):
                 r = client.get(path)
                 assert r.headers["x-content-type-options"] == "nosniff", path
                 assert r.headers["content-type"].startswith("application/json"), path
@@ -478,6 +492,42 @@ class TestHttpApi:
             assert len(line["points"]) >= 2, "a line needs two points to be a line"
             for lat, lon in line["points"]:
                 assert 53.0 < lat < 54.0 and -3.0 < lon < -1.5, "outside Greater Manchester"
+
+    def test_segments_endpoint_reports_the_model_the_board_is_using(self, live_app):
+        with TestClient(web.app) as client:
+            body = client.get("/api/segments").json()
+
+        gate = body["gate"]
+        assert gate["min_samples"] == history.MIN_SAMPLES, (
+            "the page must quote the live gate"
+        )
+        totals = body["totals"]
+        assert (
+            totals["observed"]
+            >= totals["stored"]
+            >= totals["used"]
+            >= totals["significant"]
+        )
+        assert totals["scheduled_cells"] > 0, "the timetable gives coverage a denominator"
+        assert totals["covered"] <= totals["scheduled_cells"]
+        assert len(body["segments"]) == totals["observed"]
+
+    def test_segments_report_is_cached_rather_than_rebuilt_per_view(self, live_app):
+        """It reads all of stop_events; a refresh loop must not re-run that."""
+        with TestClient(web.app) as client:
+            first = client.get("/api/segments").json()
+            second = client.get("/api/segments").json()
+        assert second["age_secs"] >= first["age_secs"]
+        assert second["totals"] == first["totals"]
+
+    def test_the_segments_page_asks_for_the_endpoint_that_exists(self, live_app):
+        """The page names this path itself; a rename would 404 in the browser only."""
+        with TestClient(web.app) as client:
+            page = client.get("/segments")
+            assert page.status_code == 200
+            assert "/api/segments" in page.text
+            assert client.get("/api/segments").status_code == 200
+        assert "text/html" in page.headers["content-type"]
 
     def test_board_places_every_stop_the_archive_knows(self, live_app):
         """The map cannot pin a stop the board does not locate.

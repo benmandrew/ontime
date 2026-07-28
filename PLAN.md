@@ -39,14 +39,39 @@
       position into `eta.predict`. Rebuild scan 17.29s to 2.16s on a single byte-level
       pass over `stop_times.txt`, output verified identical table by table.
 
+- [x] `/segments`, a page for judging the learned model rather than running it:
+      the observed → stored → used → significant funnel, coverage against the
+      6,771 segment-buckets the timetable implies, a sample-count histogram with
+      both gates drawn on it, and every segment with a distribution-free
+      confidence interval on its median. Showed three things the stats table
+      cannot express — coverage is 3.0%, nothing yet clears n = 6, and 267 of
+      484 learned buckets pair two stops the timetable never runs consecutively,
+      so the predictor has no key that could ever reach them.
+
 ## In progress
 
 - [ ] Nothing. Waiting on history to accumulate.
 
+- [x] Traced the wasted learning to its cause and fixed it. `learn_segments`
+      paired consecutive *detections* rather than consecutive *stops*, so a
+      missed stop was silently absorbed into a segment spanning it: 263 of 484
+      buckets, all unreachable by `eta.predict`. Pairing now requires scheduled
+      adjacency. The guess that `STOP_RADIUS_M` was to blame was wrong and the
+      measurement says so — detections sit a median 29m from the stop against
+      1,019m for the misses, and runs watched continuously miss nothing at all.
+
 ## Next
 
-- [ ] Run for a fortnight, then compare learned medians against the timetable to
-      see which segments the schedule gets wrong
+- [ ] Measure the skipped share on the deployment, where the poller runs
+      continuously. The local figure (57%) comes from ad-hoc dev runs and says
+      nothing about production. If it stays high there, the next suspects are
+      vehicles leaving `BBOX` mid-journey and operator dropouts, neither of
+      which a wider radius would help.
+- [ ] Reconsider `MIN_SAMPLES = 5`. It sits one observation below the smallest
+      sample that can carry a 95% interval; 6 would cost little and mean the
+      threshold matched a claim that can be made.
+- [ ] Run for a fortnight, then read the Δ column on `/segments` to see which
+      segments the schedule gets wrong
 - [ ] Interpolate along the shape rather than snapping to the nearest stop —
       `shapes.txt` is in the archive and currently unused
 - [ ] Confidence intervals on the board using the stored `p85_secs`

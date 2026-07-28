@@ -30,6 +30,8 @@
   header { display: flex; align-items: baseline; gap: .75rem; flex-wrap: wrap; margin-bottom: 1rem; }
   h1 { font-size: 1.15rem; margin: 0; letter-spacing: .01em; }
   .meta { color: var(--dim); font-size: .8rem; }
+  .navlink { margin-left: auto; color: var(--dim); font-size: .8rem; text-decoration: none; }
+  .navlink:hover { color: var(--ink); text-decoration: underline; }
   .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
   .card h2 { font-size: .95rem; margin: 0; padding: .7rem .9rem .15rem; }
@@ -91,6 +93,7 @@
 <header>
   <h1>ontime</h1>
   <span class="meta" id="meta">connecting…</span>
+  <a class="navlink" href="/segments">learned segments →</a>
 </header>
 <div id="err"></div>
 <div class="grid" id="grid"></div>

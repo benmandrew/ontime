@@ -18,6 +18,7 @@ import statistics
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
+from typing import NamedTuple
 
 from . import config, db, locking, logs
 from .matching import LONDON, Trip, haversine, service_day_offsets
@@ -202,15 +203,36 @@ def derive_stop_events(
     return written
 
 
-def learn_segments(conn: sqlite3.Connection) -> int:
-    """Aggregate consecutive stop events into per-segment traversal times.
+class SegmentSamples(NamedTuple):
+    """Traversal times per segment, and what had to be thrown away to get them."""
 
-    Reads every row of `stop_events`, so its cost is set entirely by how much
-    of that table `trim_stop_events` has left in place — see
-    `config.STOP_EVENT_RETAIN_DAYS`. The `segment_stats` rows it writes are
-    still permanent, but they now describe a rolling window rather than all
-    history, which is also the more honest model: a segment's traversal time
-    two years ago is not evidence about it today.
+    buckets: dict[tuple[str, str, str, int, int], list[float]]
+    paired: int
+    skipped: int
+
+
+def segment_samples(conn: sqlite3.Connection) -> SegmentSamples:
+    """Bucket every adjacent stop-event pair into the segment key, sorted.
+
+    Split out of `learn_segments` so that anything reporting on the learned
+    model measures the same samples the model was fitted to. `segment_stats`
+    keeps only a median, a p85 and a count; the raw vector is what a question
+    about significance actually needs, and recomputing it here beats storing
+    a second, driftable copy of it.
+
+    Pairs are required to be *adjacent in the trip's own stop sequence*. A run
+    holds only the stops that were actually detected, so when one goes
+    undetected the two events either side of it sit next to each other in this
+    list while being two stops apart on the road. Pairing those recorded a
+    segment spanning the missed stop: a bucket keyed on two stops no trip runs
+    consecutively, which `eta.predict` then never looks up, because it builds
+    its keys by walking the scheduled sequence. On one day of real data that
+    was 263 of 484 buckets — every one of them unreachable, and none of them
+    sharing a bucket with a legitimate sample.
+
+    The duration guard below cannot stand in for this. It was written with a
+    missed stop in mind, but a skipped hop between two closely spaced stops
+    lands comfortably inside 5 to 1800 seconds and sails through.
     """
     runs: dict[tuple[str, str, str], list[tuple[int, str, int]]] = defaultdict(list)
     q = (
@@ -226,25 +248,49 @@ def learn_segments(conn: sqlite3.Connection) -> int:
         route_of[key] = r["route_name"]
 
     buckets: dict[tuple[str, str, str, int, int], list[float]] = defaultdict(list)
+    paired = skipped = 0
     for key, events in runs.items():
         route = route_of[key]
         events.sort()
-        for (_s1, from_id, t1), (_s2, to_id, t2) in pairwise(events):
+        for (s1, from_id, t1), (s2, to_id, t2) in pairwise(events):
+            if s2 != s1 + 1:
+                # A stop between these two was never detected, so the gap
+                # measures a stretch of road no timetabled segment describes.
+                skipped += 1
+                continue
             secs = t2 - t1
-            # Reject impossible or implausible gaps (missed stop, layover).
+            # Reject impossible or implausible gaps (a layover, or a stop
+            # detected at the wrong end of a loop).
             if not (5 <= secs <= 1800):
                 continue
             local = datetime.fromtimestamp(t1, LONDON)
             buckets[(route, from_id, to_id, local.hour, int(local.weekday() >= 5))].append(
                 float(secs)
             )
+            paired += 1
+
+    for samples in buckets.values():
+        samples.sort()
+    return SegmentSamples(buckets, paired, skipped)
+
+
+def learn_segments(conn: sqlite3.Connection) -> int:
+    """Aggregate consecutive stop events into per-segment traversal times.
+
+    Reads every row of `stop_events`, so its cost is set entirely by how much
+    of that table `trim_stop_events` has left in place — see
+    `config.STOP_EVENT_RETAIN_DAYS`. The `segment_stats` rows it writes are
+    still permanent, but they now describe a rolling window rather than all
+    history, which is also the more honest model: a segment's traversal time
+    two years ago is not evidence about it today.
+    """
+    buckets = segment_samples(conn).buckets
 
     conn.execute("DELETE FROM segment_stats")
     rows = []
     for (route, from_id, to_id, hour, weekend), samples in buckets.items():
         if len(samples) < 2:
             continue
-        samples.sort()
         p85 = samples[min(len(samples) - 1, int(0.85 * len(samples)))]
         rows.append(
             (

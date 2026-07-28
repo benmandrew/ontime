@@ -158,6 +158,41 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     must run *before* learning, or the pass re-reads the rows it is about to drop.
     `segment_stats` rows are still permanent; they now describe a rolling window.
 
+25. **Judging the model is a separate job from running it.** `segment_stats`
+    keeps a median, a p85 and a count, which cannot say whether the count is
+    enough; `ontime/segments.py` rebuilds the sample vectors instead, via
+    `history.segment_samples` — factored out of `learn_segments` precisely so
+    the page and the model cannot drift. Three findings from it, all invisible
+    in the stats table. **A 95% interval for a median needs n ≥ 6**: order
+    statistics give at best [min, max], covering with probability 1 − 2/2ⁿ, so
+    `MIN_SAMPLES = 5` is one short of supporting the claim it implies.
+    **Coverage needs a timetable denominator**, not an observed one: 6,771
+    buckets are implied, 3.0% seen. Do not compute the CI parametrically —
+    traversal times are bounded below by the road and unbounded above by
+    traffic. `_scheduled_cells` returns adjacency *separately* from gaps:
+    published times round to the minute, so a short hop is often timetabled at
+    zero seconds, and folding the two together called four real segments
+    unreachable.
+
+26. **Pair stop events only when they are adjacent in the trip's sequence.**
+    A run holds only the stops that were detected, so a missed one leaves its
+    neighbours side by side in the list while two stops apart on the road.
+    `learn_segments` used to pair them, recording a traversal across the gap:
+    263 of 484 buckets on one day of real data, every one keyed on stops no
+    trip runs consecutively and so unreachable by `eta.predict`, which keys on
+    scheduled adjacency. The `5 <= secs <= 1800` guard was written for this and
+    cannot do it — a skipped short hop sits inside the window. Requiring
+    `s2 == s1 + 1` removed all 263, cost no coverage, and changed no bucket the
+    predictor reads. Measured, not assumed: **the detection radius was not the
+    cause**. Detections sit at a median 29m from the stop (p90 95m, cap 120m)
+    while interior misses sit at a median 1,019m, and 300m would recover only
+    10% of them. The cause is discontinuous watching — runs polled with gaps
+    under 60s had *zero* interior misses, runs with gaps over 5 minutes had
+    81%. `segment_samples` now returns `paired`/`skipped` so the page reports
+    that continuity directly. Beware: the local `data/` is ad-hoc dev runs
+    (45.7h span, 44.6h of it silent), so its skipped share is not the
+    deployment's.
+
 ## Measured baselines (Apple silicon, real data)
 
 Rebuild **2.16s** against the real 89.4MB archive (was 17.29s two-pass), the write
