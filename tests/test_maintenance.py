@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
@@ -85,6 +86,21 @@ class TestCacheIsCurrent:
         monkeypatch.setattr(maintenance.time, "monotonic", lambda: 0.0)
         assert maintenance.cache_is_current() is True
 
+    def test_a_non_wal_database_is_still_readable(self, cache):
+        """The read-only probe used to fail on a database in delete mode.
+
+        Selecting a journal mode is a write, so `PRAGMA journal_mode=WAL` on a
+        read-only handle returns SQLITE_READONLY. That surfaced here as
+        "no usable cache", and the loop rebuilt on every tick — a rebuild that
+        cannot change the answer, because the new database is read the same way.
+        """
+        conn = sqlite3.connect(config.DB_PATH)
+        conn.execute("PRAGMA journal_mode=delete")
+        conn.commit()
+        conn.close()
+
+        assert maintenance.cache_is_current() is True
+
 
 class TestBuildStampIsAServiceDate:
     """`build` writes the stamp; `cache_is_current` reads it. Both must mean
@@ -142,21 +158,88 @@ class TestBuildStampIsAServiceDate:
         )
 
 
+def run_loop(monkeypatch, *, ticks: int, ingest_fn, learn_fn):
+    """Drive `maintenance.main` for a fixed number of ticks, then break out."""
+    calls = {"sleep": 0}
+
+    def fake_sleep(_secs):
+        calls["sleep"] += 1
+        if calls["sleep"] >= ticks:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(maintenance, "run_ingest", ingest_fn)
+    monkeypatch.setattr(maintenance, "run_learn", learn_fn)
+    monkeypatch.setattr(maintenance.time, "sleep", fake_sleep)
+    with pytest.raises(KeyboardInterrupt):
+        maintenance.main()
+    return calls
+
+
+@pytest.fixture
+def stale_cache(cache):
+    """A cache whose build stamp will never satisfy `cache_is_current`."""
+    conn = db.connect()
+    conn.execute("UPDATE meta SET value='2020-01-01' WHERE key='built_at'")
+    conn.commit()
+    conn.close()
+    return cache
+
+
+class TestIngestFloor:
+    """Rebuilds need a floor between them, and only between successful ones.
+
+    Anything that keeps `cache_is_current` returning False — a feed still
+    publishing yesterday's data, a stopped clock — used to re-enter the rebuild
+    on every 60s tick: a 90MB download and a full timetable write, once a
+    minute, against the volume the board is polling.
+    """
+
+    def test_a_permanently_stale_cache_rebuilds_once_not_every_tick(
+        self, stale_cache, monkeypatch
+    ):
+        counts = {"ingest": 0}
+        run_loop(
+            monkeypatch,
+            ticks=5,
+            ingest_fn=lambda: counts.__setitem__("ingest", counts["ingest"] + 1),
+            learn_fn=lambda: None,
+        )
+        assert counts["ingest"] == 1, "the rebuild must not repeat within the floor"
+
+    def test_the_floor_lifts_once_the_interval_has_passed(self, stale_cache, monkeypatch):
+        counts = {"ingest": 0}
+        clock = {"t": 0.0}
+
+        def advancing_monotonic() -> float:
+            # A whole interval elapses between every reading of the clock.
+            clock["t"] += maintenance.MIN_INGEST_INTERVAL
+            return clock["t"]
+
+        monkeypatch.setattr(maintenance.time, "monotonic", advancing_monotonic)
+        run_loop(
+            monkeypatch,
+            ticks=4,
+            ingest_fn=lambda: counts.__setitem__("ingest", counts["ingest"] + 1),
+            learn_fn=lambda: None,
+        )
+        assert counts["ingest"] == 4, "a floor is a delay, not a one-shot latch"
+
+    def test_a_failing_rebuild_is_retried_on_the_next_tick(self, stale_cache, monkeypatch):
+        """A cold volume has no timetable at all; throttling that is an hour of
+        empty board. Only a rebuild that succeeded may hold the floor."""
+        counts = {"ingest": 0}
+
+        def failing_ingest():
+            counts["ingest"] += 1
+            raise RuntimeError("no timetable in this volume yet")
+
+        run_loop(monkeypatch, ticks=3, ingest_fn=failing_ingest, learn_fn=lambda: None)
+        assert counts["ingest"] == 3, "a failed rebuild must retry immediately"
+
+
 class TestMainLoop:
     def _run(self, monkeypatch, *, ticks: int, ingest_fn, learn_fn):
-        calls = {"sleep": 0}
-
-        def fake_sleep(_secs):
-            calls["sleep"] += 1
-            if calls["sleep"] >= ticks:
-                raise KeyboardInterrupt
-
-        monkeypatch.setattr(maintenance, "run_ingest", ingest_fn)
-        monkeypatch.setattr(maintenance, "run_learn", learn_fn)
-        monkeypatch.setattr(maintenance.time, "sleep", fake_sleep)
-        with pytest.raises(KeyboardInterrupt):
-            maintenance.main()
-        return calls
+        return run_loop(monkeypatch, ticks=ticks, ingest_fn=ingest_fn, learn_fn=learn_fn)
 
     def test_fresh_cache_is_not_rebuilt(self, cache, monkeypatch):
         counts = {"ingest": 0, "learn": 0}

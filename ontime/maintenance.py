@@ -22,6 +22,13 @@ TICK_SECS = 60
 # Segments are relearned this often; the timetable is rebuilt once per day,
 # decided by the persisted build date rather than by elapsed time.
 LEARN_INTERVAL = 3600
+# Floor between successful rebuilds. The build date decides *whether* to
+# rebuild, but anything that leaves it unsatisfied — a stopped clock, a feed
+# publishing yesterday's data — otherwise re-enters the rebuild on every tick,
+# a minute-long download and write burst once a minute, forever. A rebuild that
+# raises is deliberately not throttled: a cold volume has no timetable at all
+# and an hour of waiting is an hour of empty board.
+MIN_INGEST_INTERVAL = 3600
 
 
 def run_ingest() -> None:
@@ -78,10 +85,15 @@ def cache_is_current() -> bool:
 def main() -> None:
     logs.setup()
     last_learn: float | None = None
+    last_ingest: float | None = None
     while True:
         try:
-            if not cache_is_current():
+            if not cache_is_current() and (
+                last_ingest is None or time.monotonic() - last_ingest >= MIN_INGEST_INTERVAL
+            ):
                 run_ingest()
+                # Stamped only on success, so a failed rebuild retries next tick.
+                last_ingest = time.monotonic()
             now = time.monotonic()
             if last_learn is None or now - last_learn >= LEARN_INTERVAL:
                 run_learn()
