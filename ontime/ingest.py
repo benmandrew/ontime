@@ -160,9 +160,11 @@ def build(force: bool = False) -> None:
                 f"error. A writer killed uncleanly ages out after "
                 f"{locking.STALE_AFTER_SECS}s. Pass --force to override."
             )
-    # Held for the whole build, not stamped once at the start: the archive scan
-    # alone runs for over a minute against the real feed, and an unrefreshed
-    # record ages out mid-rebuild.
+    # Held for the whole build, not stamped once at the start. The scan measures
+    # 17.2s against the real archive on Apple silicon, comfortably inside the
+    # 90s staleness window — but that is one machine with a warm page cache, and
+    # `run_learn` under the same guard grows with the observation count rather
+    # than the archive. A record that refreshes cannot age out of any of them.
     with locking.writing("ingest"):
         _build()
 
@@ -188,11 +190,13 @@ class Cache:
 def _read_archive() -> Cache:
     """Scan the zip and return the rows to cache. Touches no database.
 
-    This takes well over a minute against the real 89MB archive, which is why
-    it happens before a connection is opened at all. Scanning inside the write
-    transaction held the lock for the whole pass, and the dashboard — writing
+    This measures 17.2s against the real 89.4MB archive, which is why it
+    happens before a connection is opened at all. Scanning inside the write
+    transaction held the lock for that whole pass, and the dashboard — writing
     every polled position to the same file every 15 seconds — failed with
-    "database is locked" from the first DELETE to the final commit.
+    "database is locked" from the first DELETE to the final commit. Splitting
+    it leaves the lock held for the inserts alone: 0.09s, half a percent of
+    the rebuild.
     """
     cache = Cache()
     with zipfile.ZipFile(config.GTFS_ZIP) as zf:

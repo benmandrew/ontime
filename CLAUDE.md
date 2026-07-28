@@ -29,8 +29,12 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
    `https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/north_west/`
    89MB zipped, 544MB unpacked, rebuilt daily. `stop_times.txt` alone is 398MB —
    always stream it out of the zip, never unpack or read it whole.
-5. **GTFS times exceed 24h** for post-midnight trips. Service-day handling lives in
-   `matching.service_day_offsets`.
+5. **GTFS times exceed 24h** for post-midnight trips, and the service day starts at
+   noon minus 12 hours — *not* local midnight. The two differ only on the clock-change
+   days, where local midnight put every bus exactly 60 minutes out for the whole day —
+   inside the 90-minute guard, so nothing suppressed it. `matching.service_midnight` is
+   the anchor; `service_day_offsets` measures both the same-day and previous-day offsets
+   against it rather than adding a flat 86,400.
 6. **Do not reintroduce fastapi.** It was dropped for starlette: nothing used a fastapi
    feature, its pydantic was 8.6MB of a 14MB venv and the only compiled dependency, and
    nixpkgs has no darwin cache for it so `nix develop` built it from source and pulled in
@@ -41,6 +45,12 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
 8. **`derive_stop_events` scans only 26 hours** and is idempotent. Do not widen it to
    the full retention window — that reloads hundreds of thousands of rows hourly to
    rewrite results that cannot have changed. Tests pass `WIDE_LOOKBACK_HOURS`.
+   Idempotence rests on two things. The window is wider than a day, so a (trip, vehicle)
+   group can hold two runs; they split on silence over `RUN_GAP_SECS` (3h — longest
+   journey 63 min, consecutive days ~22h apart). And the service date comes from the
+   run's *last* observation, since the window and trim only remove positions from the
+   front; anchoring on the first made a midnight-straddling run migrate to a second date
+   and be written twice. Not `Trip.service_date` — callers key that dict on trip_id.
 9. **Alpine needs tzdata.** Every service-day calculation goes through
    `ZoneInfo("Europe/London")`. The base ships it, but the Dockerfile installs it
    explicitly so a base change fails the build rather than the arithmetic.
@@ -61,20 +71,51 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     live 192s head to Stockport, and a time-only match assigned them to northbound
     runs — the source of "362 minutes early" on the board. Require `DestinationRef`
     to appear *after* the vehicle's position; terminus ATCO codes are shared between
-    directions so comparing termini alone is not enough.
-14. **Never break a match tie on distance.** Every trip on a route follows one road,
-    so the whole candidate set sits within metres and "closest path" is arbitrary.
-    Tie on departure time. Distance-based ties produced 20-45 minute phantom delays.
+    directions so comparing termini alone is not enough. Resolve that position on
+    *each* candidate. Borrowing one candidate's anchor stop and demanding it of the
+    rest made the filter order-dependent: with a reverse trip sorted first, every
+    forward candidate failed and the match was dropped entirely.
+14. **Never break a match tie on distance, but do bound it.** Every trip on a route
+    follows one road, so the candidate set sits within metres and "closest path" is
+    arbitrary — tie on departure time; distance ties gave 20-45 minute phantom delays.
+    Distance is still a veto on the *winner*: refs are not proof, and a bus broadcasting
+    a finished journey's refs en route to the depot matched at tier 1 from 12km out.
+    `MAX_OFF_ROUTE_M` (1000m) rejects it, falling through to the geometric tier rather
+    than vanishing. From 39,394 real stop gaps: median 284m, p99 496m, max 1,538m — so
+    the worst legitimate reading is 769m, against 2,905m for the depot case.
 15. **Do not claim a delay that is not known.** A geometry-only match cannot identify
     the run, so `schedule_confident` is False and the delay is withheld; the arrival
     is positional and still holds. Delays past 90 minutes are suppressed as
-    mismatches rather than displayed.
+    mismatches rather than displayed. A delay of exactly zero is *known* — serialise
+    it with `is not None`, never a truth test.
+16. **Validate the archive before it displaces the good one.** Without a
+    `Content-Length` urllib3 cannot see a truncated download, so a half-received zip
+    replaced a working cache and the 20h freshness check then refused to re-fetch it:
+    every rebuild raised `BadZipFile` for 20 hours. Check the byte count and open the
+    zip before `replace()`.
+17. **Feed text is hostile.** `DestinationName` is operator-supplied free text that
+    reaches the page. It is escaped at render and the page carries a hash-based CSP;
+    do not add an inline `style=` attribute or the policy will reject it. A malformed
+    numeric field must cost one vehicle, never the poll — a single bad `Bearing`
+    blanked all three stops.
+18. **A writer's heartbeat is named per process**, not per kind of work
+    (`locking._writer_id`). Naming it after the kind meant a host ingest and the
+    container's rebuild shared one record, excluded it as their own, and were
+    invisible to each other — the exact pairing fact 12 exists to catch. Long work
+    holds it through `locking.writing()`, which refreshes it; a single stamp aged out.
 
 ## Measured baselines (Apple silicon, real data)
 
-Ingest 17s · cache 8.9MB · match 0.32ms/vehicle · duty cycle <3% at a 15s poll ·
-RSS 64MB · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured, not extrapolated). Docker image 62.4MB (19.6MB gzipped; was 220MB), non-root,
-no pip/fastapi/pydantic. `nix develop` ~10s. 137 tests in ~2s.
+Rebuild 17.29s against the real 89.4MB archive, the write lock held for **0.09s** of
+it — the scan runs before a connection opens, which is why the board no longer 502s
+nightly. Cache 7.6MB · RSS 62MB · duty cycle <3% at a 15s poll · history 6,018 rows/day
+= 0.6MB/day, 12MB at 21 days (measured). Docker image 62.4MB (19.6MB gzipped; was
+220MB), non-root, no pip/fastapi/pydantic. `nix develop` ~10s. 208 tests in ~4s.
+
+Matching 1.89ms per *matching* vehicle against the 890-trip pool `web.py` passes. The
+old 0.32ms counted every feed vehicle, most exiting on the route-name filter — not
+comparable, and not a regression. Per-candidate direction filtering (fact 13) measured
+1.869ms before against 1.893ms after, +1.3%, memoised by stop id per vehicle.
 
 ## Constraints
 
