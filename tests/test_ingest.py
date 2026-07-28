@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import shutil
+import sqlite3
+import zipfile
 
 import pytest
 
@@ -77,6 +80,207 @@ class TestBuild:
     def test_records_build_date(self, built_db):
         row = built_db.execute("SELECT value FROM meta WHERE key='built_at'").fetchone()
         assert row is not None
+
+
+def competing_write() -> Exception | None:
+    """Write from a second connection that refuses to queue for the lock.
+
+    `timeout=0` is the point: the caller wants to know whether the lock is free
+    right now, not to wait until it is.
+    """
+    conn = sqlite3.connect(config.DB_PATH, timeout=0)
+    try:
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('probe', '1')")
+        conn.commit()
+    except sqlite3.OperationalError as exc:
+        return exc
+    finally:
+        conn.close()
+    return None
+
+
+def probe_mid_scan(monkeypatch, probe):
+    """Run `probe` once, at the start of the first pass over stop_times.txt.
+
+    `ingest.rows` is a generator function, so the body does not run until the
+    scan pulls the first row — which puts the probe genuinely inside the scan
+    rather than before it.
+    """
+    real_rows = ingest.rows
+    fired = []
+
+    def probing_rows(zf, name):
+        if name == "stop_times.txt" and not fired:
+            fired.append(probe())
+        yield from real_rows(zf, name)
+
+    monkeypatch.setattr(ingest, "rows", probing_rows)
+    return fired
+
+
+class TestRebuildDoesNotHoldTheWriteLock:
+    """The scan must finish before the database is touched.
+
+    `_build` used to open a connection, `DELETE FROM` six tables and only then
+    begin the two-pass scan of `stop_times.txt`, which runs for well over a
+    minute against the real 89MB archive. The DELETEs open the write
+    transaction, so the lock was held for the whole scan, and the dashboard —
+    writing every polled position to the same database every 15 seconds —
+    failed with "database is locked" from the first DELETE to the commit.
+    """
+
+    def test_another_writer_gets_through_during_the_scan(self, data_dir, monkeypatch):
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        conn = db.connect()
+        db.init(conn)  # the probe needs somewhere to write
+        conn.close()
+
+        fired = probe_mid_scan(monkeypatch, competing_write)
+        ingest.build()
+
+        assert fired, "the probe never ran, so the test proves nothing"
+        assert fired[0] is None, f"the rebuild held the write lock: {fired[0]}"
+
+    def test_a_reader_sees_the_old_timetable_until_the_commit(self, data_dir, monkeypatch):
+        """Emptying the tables early would expose a board with nothing on it."""
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+
+        def count_trips() -> int:
+            conn = db.connect(readonly=True)
+            try:
+                return conn.execute("SELECT COUNT(*) c FROM trips").fetchone()["c"]
+            finally:
+                conn.close()
+
+        fired = probe_mid_scan(monkeypatch, count_trips)
+        ingest.build()
+
+        assert fired == [30], "the previous timetable must stay visible until commit"
+
+    def test_the_connection_is_closed_when_the_write_fails(self, data_dir, monkeypatch):
+        """A leaked connection keeps a stale WAL reader pinned for the process."""
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        opened = []
+        real_connect = db.connect
+
+        def tracking_connect(*a, **k):
+            conn = real_connect(*a, **k)
+            opened.append(conn)
+            return conn
+
+        def exploding_init(_conn):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ingest.db, "connect", tracking_connect)
+        monkeypatch.setattr(ingest.db, "init", exploding_init)
+        with pytest.raises(RuntimeError):
+            ingest.build()
+
+        assert opened, "no connection was opened"
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened[0].execute("SELECT 1")
+
+
+class FakeResponse:
+    """Just enough of a streamed `requests` response for `download`."""
+
+    def __init__(self, body: bytes, content_length: int | None):
+        self.body = body
+        self.headers = (
+            {} if content_length is None else {"content-length": str(content_length)}
+        )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        for i in range(0, len(self.body), size):
+            yield self.body[i : i + size]
+
+
+def serve(monkeypatch, body: bytes, content_length: int | None = None):
+    monkeypatch.setattr(
+        ingest.requests, "get", lambda *_a, **_k: FakeResponse(body, content_length)
+    )
+
+
+def archive_without(member: str) -> bytes:
+    """The real fixture archive, re-zipped with one member left out."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(MINI_GTFS) as src, zipfile.ZipFile(buf, "w") as dst:
+        for name in src.namelist():
+            if name != member:
+                dst.writestr(name, src.read(name))
+    return buf.getvalue()
+
+
+class TestDownloadValidation:
+    """A bad download must never displace a working archive.
+
+    `download` read `content-length` but never compared it against the bytes
+    received, and replaced the cached archive unconditionally. When the
+    response carries no `Content-Length` the body is framed by the connection
+    closing and urllib3 cannot detect truncation, so `download` returned
+    happily with a corrupt file in place — which then carried a fresh mtime,
+    so the 20-hour freshness check refused to re-fetch it and every rebuild
+    raised `BadZipFile` for the next twenty hours.
+    """
+
+    @pytest.fixture
+    def good(self, data_dir) -> bytes:
+        body = MINI_GTFS.read_bytes()
+        config.GTFS_ZIP.write_bytes(body)
+        return body
+
+    def test_truncation_is_caught_without_a_content_length(
+        self, good, data_dir, monkeypatch
+    ):
+        serve(monkeypatch, good[: len(good) // 2], content_length=None)
+        with pytest.raises(OSError):
+            ingest.download(force=True)
+        assert config.GTFS_ZIP.read_bytes() == good, "the good archive was destroyed"
+
+    def test_a_short_body_is_caught_against_the_declared_length(
+        self, good, data_dir, monkeypatch
+    ):
+        serve(monkeypatch, good[:-100], content_length=len(good))
+        with pytest.raises(OSError):
+            ingest.download(force=True)
+        assert config.GTFS_ZIP.read_bytes() == good
+
+    def test_an_archive_missing_a_required_member_is_rejected(
+        self, good, data_dir, monkeypatch
+    ):
+        body = archive_without("stop_times.txt")
+        serve(monkeypatch, body, content_length=len(body))
+        with pytest.raises(OSError):
+            ingest.download(force=True)
+        assert config.GTFS_ZIP.read_bytes() == good
+
+    def test_a_failed_download_leaves_no_part_file(self, good, data_dir, monkeypatch):
+        """A stray `.part` is dead weight the size of the archive."""
+        serve(monkeypatch, good[: len(good) // 2], content_length=None)
+        with pytest.raises(OSError):
+            ingest.download(force=True)
+        assert not config.GTFS_ZIP.with_suffix(".part").exists()
+
+    def test_a_complete_archive_replaces_the_old_one(self, data_dir, monkeypatch):
+        config.GTFS_ZIP.write_bytes(b"stale")
+        body = MINI_GTFS.read_bytes()
+        serve(monkeypatch, body, content_length=len(body))
+
+        ingest.download(force=True)
+
+        assert config.GTFS_ZIP.read_bytes() == body
+        assert not config.GTFS_ZIP.with_suffix(".part").exists()
+        ingest.build()  # and it is genuinely buildable
 
 
 class TestDownloadCaching:
