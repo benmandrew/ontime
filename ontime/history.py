@@ -20,7 +20,7 @@ from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 
 from . import config, db, logs
-from .matching import LONDON, Trip, haversine
+from .matching import LONDON, Trip, haversine, service_day_offsets
 
 log = logs.get("ontime.history")
 
@@ -33,6 +33,16 @@ MIN_SAMPLES = 5
 # How far back `derive_stop_events` scans raw positions. Wider than the hourly
 # cadence it runs at, so a skipped pass loses nothing.
 LOOKBACK_HOURS = 26
+
+# Quiet time that separates one run from the next within a (trip, vehicle)
+# group. Because the window above is wider than a day, a vehicle rostered onto
+# the same trip_id two days running arrives as one group and has to be cut
+# apart. Nothing inside a single run comes close to this — the longest journey
+# through the watched stops is barely an hour — while consecutive days leave
+# some twenty-two hours of silence between them.
+RUN_GAP_SECS = 3 * 3600
+
+Points = list[tuple[int, float, float]]  # recorded_at, lat, lon
 
 
 def record(conn: sqlite3.Connection, vehicle, trip_id: str | None) -> None:
@@ -59,13 +69,57 @@ def trim(conn: sqlite3.Connection, retain_days: int) -> int:
     return cur.rowcount
 
 
+def _split_runs(points: Points) -> list[Points]:
+    """Cut a (trip, vehicle) group into the separate runs it holds."""
+    runs: list[Points] = [[points[0]]]
+    for prev, cur in pairwise(points):
+        if cur[0] - prev[0] > RUN_GAP_SECS:
+            runs.append([])
+        runs[-1].append(cur)
+    return runs
+
+
+def _service_date(trip: Trip, run: Points) -> str:
+    """The service day a run belongs to, whatever is left of it.
+
+    The day of the earliest surviving observation is the wrong answer. The scan
+    window slides forward, so a run straddling local midnight loses its
+    pre-midnight head and its earliest survivor moves into the next calendar
+    day; the run is then written again under a second service date instead of
+    replacing its own rows, and one journey is learned twice.
+
+    The last observation anchors it instead. The window and the retention trim
+    both take positions off the front, never the back, so the end of a finished
+    run does not move. GTFS expresses a post-midnight journey as 24:xx-27:30 on
+    the *previous* day, so an instant just after midnight belongs to two
+    candidate service days; the one whose timetable the run actually fits wins.
+    Note that this cannot come from `trip.service_date` — callers build the
+    trips dict keyed on trip_id, which collapses every day a trip runs on into
+    one entry.
+    """
+    candidates = service_day_offsets(datetime.fromtimestamp(run[-1][0], UTC))
+    sched_end = next(
+        (arr for _seq, _sid, arr, _lat, _lon in reversed(trip.stops) if arr is not None),
+        trip.first_dep if trip.first_dep >= 0 else None,
+    )
+    if sched_end is None:
+        return candidates[0][0].isoformat()
+    # The candidates are a day apart, so this choice cannot flip as the head of
+    # the run is trimmed away — which is the whole point of anchoring here.
+    day, _secs = min(candidates, key=lambda c: abs(c[1] - sched_end))
+    return day.isoformat()
+
+
 def derive_stop_events(
-    conn: sqlite3.Connection, trips: dict[str, Trip], lookback_hours: int = LOOKBACK_HOURS
+    conn: sqlite3.Connection,
+    trips: dict[str, Trip],
+    lookback_hours: float = LOOKBACK_HOURS,
 ) -> int:
     """Reduce raw positions to one closest-approach event per stop per run.
 
     Only runs that have gone quiet for an hour are processed, so a trip still
-    in progress is not frozen halfway.
+    in progress is not frozen halfway. A group is one (trip, vehicle) pair,
+    which can hold more than one run — see `_split_runs`.
 
     The scan is bounded to `lookback_hours`. Reducing a run is idempotent —
     the write is an upsert keyed on (service_date, trip, vehicle, seq) — so
@@ -78,7 +132,7 @@ def derive_stop_events(
     now = datetime.now(UTC)
     quiet_before = int((now - timedelta(hours=1)).timestamp())
     since = int((now - timedelta(hours=lookback_hours)).timestamp())
-    groups: dict[tuple[str, str], list[tuple[int, float, float]]] = defaultdict(list)
+    groups: dict[tuple[str, str], Points] = defaultdict(list)
 
     q = (
         "SELECT trip_id, vehicle_ref, recorded_at, lat, lon FROM observations "
@@ -91,28 +145,40 @@ def derive_stop_events(
 
     written = 0
     for (trip_id, vehicle_ref), points in groups.items():
-        if not points or points[-1][0] > quiet_before:
-            continue
         trip = trips.get(trip_id)
-        if trip is None:
+        if trip is None or not points:
             continue
-        svc_date = datetime.fromtimestamp(points[0][0], LONDON).date().isoformat()
-
-        for seq, stop_id, sched_arr, slat, slon in trip.stops:
-            best_t, best_d = None, float("inf")
-            for ts, lat, lon in points:
-                d = haversine(lat, lon, slat, slon)
-                if d < best_d:
-                    best_t, best_d = ts, d
-            if best_t is None or best_d > STOP_RADIUS_M:
+        for run in _split_runs(points):
+            # Judged per run, not per group: yesterday's finished journey must
+            # still be reduced while today's is halfway down the road.
+            if run[-1][0] > quiet_before:
                 continue
-            conn.execute(
-                "INSERT OR REPLACE INTO stop_events "
-                "(trip_id, vehicle_ref, service_date, seq, stop_id, actual_at, "
-                " sched_arr, dist_m) VALUES (?,?,?,?,?,?,?,?)",
-                (trip_id, vehicle_ref, svc_date, seq, stop_id, best_t, sched_arr, best_d),
-            )
-            written += 1
+            svc_date = _service_date(trip, run)
+
+            for seq, stop_id, sched_arr, slat, slon in trip.stops:
+                best_t, best_d = None, float("inf")
+                for ts, lat, lon in run:
+                    d = haversine(lat, lon, slat, slon)
+                    if d < best_d:
+                        best_t, best_d = ts, d
+                if best_t is None or best_d > STOP_RADIUS_M:
+                    continue
+                conn.execute(
+                    "INSERT OR REPLACE INTO stop_events "
+                    "(trip_id, vehicle_ref, service_date, seq, stop_id, actual_at, "
+                    " sched_arr, dist_m) VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        trip_id,
+                        vehicle_ref,
+                        svc_date,
+                        seq,
+                        stop_id,
+                        best_t,
+                        sched_arr,
+                        best_d,
+                    ),
+                )
+                written += 1
     conn.commit()
     return written
 

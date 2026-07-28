@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import pytest
 
@@ -27,6 +27,34 @@ class FakeVehicle:
         self.lon = lon
         self.route_name = route
         self.bearing = bearing
+
+
+def midweek_midnight(days_ago: int = 0) -> datetime:
+    """Local midnight on a recent midweek day.
+
+    Segment buckets key on the local hour and on weekday-versus-weekend, so
+    runs that have to land in the same bucket cannot be placed relative to
+    `now`: a pair of consecutive days straddling a Saturday would split them.
+    Anchoring on the Wednesday a week back keeps every day used here a weekday,
+    well clear of a DST changeover, and long finished.
+    """
+    day = datetime.now(LONDON).date() - timedelta(days=7)
+    day -= timedelta(days=(day.weekday() - 2) % 7)  # the Wednesday on or before
+    return datetime.combine(day - timedelta(days=days_ago), time(), tzinfo=LONDON)
+
+
+def event_rows(conn) -> list[tuple]:
+    return [
+        tuple(r)
+        for r in conn.execute(
+            "SELECT service_date, trip_id, vehicle_ref, seq, actual_at FROM stop_events "
+            "ORDER BY service_date, seq"
+        )
+    ]
+
+
+def sample_counts(conn) -> list[int]:
+    return sorted(r["samples"] for r in conn.execute("SELECT samples FROM segment_stats"))
 
 
 def drive(conn, trip, vehicle_ref, start: datetime, secs_per_stop: int, upto=None):
@@ -111,6 +139,66 @@ class TestDeriveStopEvents:
             == 0
         )
 
+    def test_consecutive_days_of_one_vehicle_are_separate_runs(self, built_db, trip):
+        """The scan window is deliberately wider than a day, so a vehicle
+        working the same trip_id on two days arrived as a single group. With no
+        run split the closest-approach scan wrote one event per stop, taken
+        from whichever day happened to be marginally nearer, and the upsert
+        then overwrote the previous day's already-correct rows.
+        """
+        for days_ago in (1, 0):
+            drive(
+                built_db,
+                trip,
+                "V1",
+                midweek_midnight(days_ago) + timedelta(hours=10),
+                60,
+                upto=8,
+            )
+
+        written = history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
+        assert written == 16
+
+        by_date: dict[str, set[int]] = {}
+        for r in built_db.execute("SELECT service_date, seq FROM stop_events"):
+            by_date.setdefault(r["service_date"], set()).add(r["seq"])
+        assert len(by_date) == 2, "one service date per run"
+        assert all(seqs == set(range(8)) for seqs in by_date.values())
+
+    def test_midnight_straddling_run_keeps_its_service_date(self, built_db, trip):
+        """The service date came from the earliest surviving observation, so
+        once the window slid past local midnight a run's post-midnight tail was
+        written again under a second service date instead of replacing its own
+        rows — one physical journey stored, and later learned, twice.
+        """
+        for days_ago, ref in ((1, "V1"), (0, "V2")):
+            drive(
+                built_db,
+                trip,
+                ref,
+                midweek_midnight(days_ago) - timedelta(minutes=20),
+                180,
+                upto=16,
+            )
+
+        assert (
+            history.derive_stop_events(
+                built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+            )
+            == 32
+        )
+        before = event_rows(built_db)
+        assert len({r[0] for r in before}) == 2, "one service date per run"
+
+        # Advance the window to the later run's local midnight: its pre-midnight
+        # head is gone and the earlier run has dropped out altogether, which is
+        # exactly what the hourly pass sees as the day turns over.
+        elapsed = (datetime.now(UTC) - midweek_midnight(0)).total_seconds() / 3600
+        history.derive_stop_events(built_db, {trip.trip_id: trip}, lookback_hours=elapsed)
+        assert event_rows(built_db) == before
+
     def test_distant_positions_do_not_count_as_passing(self, built_db, trip):
         start = datetime.now(UTC) - timedelta(hours=4)
         for i in range(10):
@@ -178,6 +266,52 @@ class TestLearnSegments:
         )
         history.learn_segments(built_db)
         assert history.load_segment_stats(built_db) == {}
+
+    def test_consecutive_days_give_two_independent_samples(self, built_db, trip):
+        """Collapsing both days into one run left a single sample per bucket,
+        and the two-sample floor then discarded every segment: nothing learned
+        from two clean journeys.
+        """
+        for days_ago in (1, 0):
+            drive(
+                built_db,
+                trip,
+                "V1",
+                midweek_midnight(days_ago) + timedelta(hours=10),
+                60,
+                upto=8,
+            )
+        history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
+
+        assert history.learn_segments(built_db) == 7
+        assert sample_counts(built_db) == [2] * 7
+
+    def test_a_midnight_run_is_learned_once_as_the_window_slides(self, built_db, trip):
+        """Rewriting the post-midnight tail under a second service date made
+        one journey look like two, doubling the samples and dragging the median
+        towards the duplicated half.
+        """
+        for days_ago, ref in ((1, "V1"), (0, "V2")):
+            drive(
+                built_db,
+                trip,
+                ref,
+                midweek_midnight(days_ago) - timedelta(minutes=20),
+                180,
+                upto=16,
+            )
+        history.derive_stop_events(
+            built_db, {trip.trip_id: trip}, lookback_hours=WIDE_LOOKBACK_HOURS
+        )
+        learned = history.learn_segments(built_db)
+        assert sample_counts(built_db) == [2] * learned
+
+        elapsed = (datetime.now(UTC) - midweek_midnight(0)).total_seconds() / 3600
+        history.derive_stop_events(built_db, {trip.trip_id: trip}, lookback_hours=elapsed)
+        assert history.learn_segments(built_db) == learned
+        assert sample_counts(built_db) == [2] * learned
 
     def test_relearning_replaces_rather_than_accumulates(self, built_db, trip):
         base = datetime.now(UTC) - timedelta(hours=6)
