@@ -69,6 +69,25 @@ def trim(conn: sqlite3.Connection, retain_days: int) -> int:
     return cur.rowcount
 
 
+def trim_stop_events(conn: sqlite3.Connection, retain_days: int) -> int:
+    """Discard derived events outside the learning window.
+
+    Run *before* `learn_segments`, not after: the aggregate is rebuilt from
+    whatever this leaves behind, so trimming afterwards would relearn from the
+    full table and only then shrink it, which is the cost this exists to avoid.
+
+    `service_date` is an ISO date, so the lexicographic comparison SQLite does
+    here is chronological. It is the run's own service day rather than the
+    wall-clock time of the observation, which is what makes the cutoff stable:
+    a post-midnight run is dated to the service day it belongs to, so it ages
+    out with the rest of that day instead of a day late.
+    """
+    cutoff = (datetime.now(LONDON).date() - timedelta(days=retain_days)).isoformat()
+    cur = conn.execute("DELETE FROM stop_events WHERE service_date < ?", (cutoff,))
+    conn.commit()
+    return cur.rowcount
+
+
 def _split_runs(points: Points) -> list[Points]:
     """Cut a (trip, vehicle) group into the separate runs it holds."""
     runs: list[Points] = [[points[0]]]
@@ -184,7 +203,15 @@ def derive_stop_events(
 
 
 def learn_segments(conn: sqlite3.Connection) -> int:
-    """Aggregate consecutive stop events into per-segment traversal times."""
+    """Aggregate consecutive stop events into per-segment traversal times.
+
+    Reads every row of `stop_events`, so its cost is set entirely by how much
+    of that table `trim_stop_events` has left in place — see
+    `config.STOP_EVENT_RETAIN_DAYS`. The `segment_stats` rows it writes are
+    still permanent, but they now describe a rolling window rather than all
+    history, which is also the more honest model: a segment's traversal time
+    two years ago is not evidence about it today.
+    """
     runs: dict[tuple[str, str, str], list[tuple[int, str, int]]] = defaultdict(list)
     q = (
         "SELECT e.service_date, e.trip_id, e.vehicle_ref, e.seq, e.stop_id, "
@@ -285,11 +312,13 @@ def main() -> None:
         trips = {t.trip_id: t for t in load_trips(conn, days)}
 
         events = derive_stop_events(conn, trips)
+        aged = trim_stop_events(conn, config.STOP_EVENT_RETAIN_DAYS)
         segments = learn_segments(conn)
         removed = trim(conn, config.RETAIN_DAYS)
         log.info(
-            "stop events=%d segments=%d trimmed=%d %s",
+            "stop events=%d aged out=%d segments=%d trimmed=%d %s",
             events,
+            aged,
             segments,
             removed,
             stats_summary(conn),

@@ -68,6 +68,15 @@ HORIZON_SECS = int(os.getenv("ONTIME_HORIZON_SECS", "3600"))
 # derived before trimming and are kept permanently.
 RETAIN_DAYS = int(os.getenv("ONTIME_RETAIN_DAYS", "21"))
 
+# Derived stop events older than this are discarded. They used to be kept for
+# ever, which cost twice over: the table grew without bound, and `learn_segments`
+# re-aggregates every row it can see on every hourly pass while holding the write
+# lock, so that pass grew without bound too — 105ms at a month of history, 1.3s
+# at a year, 4.4s and a 192MB table at three. Ninety days is wide enough to hold
+# a full seasonal picture of each segment and to keep the hourly pass in the
+# hundreds of milliseconds.
+STOP_EVENT_RETAIN_DAYS = int(os.getenv("ONTIME_STOP_EVENT_RETAIN_DAYS", "90"))
+
 # How long a statement waits for another process to release the write lock.
 # Five seconds was not enough: the timetable rebuild and the 15s poll loop both
 # write to the same database, and a rebuild's insert burst can outlast a short

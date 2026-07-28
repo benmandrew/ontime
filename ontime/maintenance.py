@@ -53,11 +53,16 @@ def run_learn() -> None:
         days = tuple(today - timedelta(days=i) for i in range(config.RETAIN_DAYS + 1))
         trips = {t.trip_id: t for t in load_trips(conn, days)}
         events = history.derive_stop_events(conn, trips)
+        # Before learning, not after: the aggregate is rebuilt from whatever
+        # survives, and re-reading rows that are about to be deleted is the
+        # unbounded cost this is here to bound.
+        aged = history.trim_stop_events(conn, config.STOP_EVENT_RETAIN_DAYS)
         segments = history.learn_segments(conn)
         removed = history.trim(conn, config.RETAIN_DAYS)
         log.info(
-            "events=%d segments=%d trimmed=%d %s",
+            "events=%d aged out=%d segments=%d trimmed=%d %s",
             events,
+            aged,
             segments,
             removed,
             history.stats_summary(conn),

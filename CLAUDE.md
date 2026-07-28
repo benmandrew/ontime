@@ -123,6 +123,12 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     text can only corrupt the discarded remainder. A reordered header falls back to
     `csv` rather than caching shifted times — a failed rebuild means a board ageing
     by a day per day, so this path must never simply raise.
+20. **Bound anything that re-aggregates history.** `learn_segments` reads all of
+    `stop_events` on every hourly pass while holding the write lock, and nothing
+    used to delete from that table: 105ms at a month, 1.3s at a year, 4.4s and
+    192MB at three. `trim_stop_events` caps it at `STOP_EVENT_RETAIN_DAYS` (90) and
+    must run *before* learning, or the pass re-reads the rows it is about to drop.
+    `segment_stats` rows are still permanent; they now describe a rolling window.
 
 ## Measured baselines (Apple silicon, real data)
 
@@ -147,7 +153,8 @@ comparable, and not a regression. Per-candidate direction filtering (fact 13) me
 - Deployment is Docker behind `tailscale serve`. Port binds to `127.0.0.1` only.
   Never `tailscale funnel`: the app has no authentication.
 - Learned history is the valuable artefact. It lives in the `ontime-data` volume.
-  Raw positions trim at 21 days; `segment_stats` is permanent. Do not drop that table.
+  Raw positions trim at 21 days, derived `stop_events` at 90; `segment_stats` is
+  permanent. Do not drop that table.
 
 ## Standards
 
