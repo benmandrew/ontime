@@ -28,7 +28,10 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
 4. **Use the prebuilt regional GTFS**, not TransXChange:
    `https://data.bus-data.dft.gov.uk/timetable/download/gtfs-file/north_west/`
    89MB zipped, 544MB unpacked, rebuilt daily. `stop_times.txt` alone is 398MB —
-   always stream it out of the zip, never unpack or read it whole.
+   always stream it out of the zip, never unpack or read it whole. The download
+   cannot be trimmed: 20.5MB of it is `shapes.txt`, which nothing reads, but BODS
+   answers a `Range:` request with 200 and no `Accept-Ranges`, so members cannot
+   be fetched selectively. The scan is one pass, not two — see 19.
 5. **GTFS times exceed 24h** for post-midnight trips, and the service day starts at
    noon minus 12 hours — *not* local midnight. The two differ only on the clock-change
    days, where local midnight put every bus exactly 60 minutes out for the whole day —
@@ -103,14 +106,28 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     container's rebuild shared one record, excluded it as their own, and were
     invisible to each other — the exact pairing fact 12 exists to catch. Long work
     holds it through `locking.writing()`, which refreshes it; a single stamp aged out.
+19. **`stop_times.txt` is grouped by trip, so scan it once.** Verified across all
+    106,058 trips in the real archive: no trip's rows are interrupted by another's,
+    and at most one trip is ever open. `_scan_stop_times` buffers the trip in hand
+    (~44 rows) and keeps it only if it called at a watched stop, which replaced two
+    full passes. It also splits bytes instead of using `csv.DictReader`, which was
+    7.7s of a 7.9s pass — decompressing the whole 398MB member is 0.26s, so parsing
+    was the cost, never the zip or the I/O. Only the 54,131 rows kept get decoded.
+    Every row carries a quoted `stop_headsign`; the split is bounded at the last
+    column read and every column read precedes it, so a comma in that operator free
+    text can only corrupt the discarded remainder. A reordered header falls back to
+    `csv` rather than caching shifted times — a failed rebuild means a board ageing
+    by a day per day, so this path must never simply raise.
 
 ## Measured baselines (Apple silicon, real data)
 
-Rebuild 17.29s against the real 89.4MB archive, the write lock held for **0.09s** of
-it — the scan runs before a connection opens, which is why the board no longer 502s
-nightly. Cache 7.6MB · RSS 62MB · duty cycle <3% at a 15s poll · history 6,018 rows/day
-= 0.6MB/day, 12MB at 21 days (measured). Docker image 62.4MB (19.6MB gzipped; was
-220MB), non-root, no pip/fastapi/pydantic. `nix develop` ~10s. 208 tests in ~4s.
+Rebuild **2.16s** against the real 89.4MB archive (was 17.29s two-pass), the write
+lock held for 0.09s of it — the scan runs before a connection opens, which is why the
+board no longer 502s nightly. Scan peak RSS 68MB, up from 62MB: the cost of reading
+in 1MB chunks. 4MB chunks measured no faster and 27MB worse. Cache 7.6MB · duty cycle
+<3% at a 15s poll · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured).
+Docker image 62.4MB (19.6MB gzipped; was 220MB), non-root, no pip/fastapi/pydantic.
+`nix develop` ~10s. 208 tests in ~4s.
 
 Matching 1.89ms per *matching* vehicle against the 890-trip pool `web.py` passes. The
 old 0.32ms counted every feed vehicle, most exiting on the route-name filter — not

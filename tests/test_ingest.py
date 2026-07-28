@@ -100,21 +100,24 @@ def competing_write() -> Exception | None:
 
 
 def probe_mid_scan(monkeypatch, probe):
-    """Run `probe` once, at the start of the first pass over stop_times.txt.
+    """Run `probe` once, inside the scan of stop_times.txt.
 
-    `ingest.rows` is a generator function, so the body does not run until the
-    scan pulls the first row — which puts the probe genuinely inside the scan
-    rather than before it.
+    Hooked on `_parse_time_bytes`, which the scan calls only when it has found
+    a trip worth keeping — so the probe fires partway through the pass rather
+    than before it, which is what makes the result mean anything. It used to
+    hang off `ingest.rows`; stop_times no longer goes through that, and the
+    probe silently stopped firing while the assertions still passed on an
+    empty list, so the test proved nothing until it was pointed here.
     """
-    real_rows = ingest.rows
+    real_parse = ingest._parse_time_bytes
     fired = []
 
-    def probing_rows(zf, name):
-        if name == "stop_times.txt" and not fired:
+    def probing_parse(value):
+        if not fired:
             fired.append(probe())
-        yield from real_rows(zf, name)
+        return real_parse(value)
 
-    monkeypatch.setattr(ingest, "rows", probing_rows)
+    monkeypatch.setattr(ingest, "_parse_time_bytes", probing_parse)
     return fired
 
 

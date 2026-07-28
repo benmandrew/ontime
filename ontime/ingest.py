@@ -139,6 +139,150 @@ def rows(zf: zipfile.ZipFile, name: str) -> Iterator[dict[str, str]]:
         yield from csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig"))
 
 
+# The columns the stop_times scan reads, in the order the cached tuples want.
+STOP_TIME_COLUMNS = (
+    "trip_id",
+    "arrival_time",
+    "departure_time",
+    "stop_id",
+    "stop_sequence",
+)
+
+# Read size for the byte scan. 1MB measured 2.62s at 72MB peak RSS against the
+# real archive; 4MB was no faster and cost 27MB more.
+SCAN_CHUNK = 1 << 20
+
+TripStops = list[tuple[str, int, str, int | None, int | None]]
+TargetCalls = dict[str, list[tuple[str, int, int | None]]]
+
+
+def _parse_time_bytes(value: bytes) -> int | None:
+    return parse_gtfs_time(value.decode())
+
+
+def _scan_stop_times(zf: zipfile.ZipFile) -> tuple[TripStops, TargetCalls]:
+    """Collect every watched trip's full stop sequence in a single pass.
+
+    This used to be two passes over the largest member in the archive — 4.6
+    million rows, 398MB — one to find the trips calling at a watched stop and
+    another to collect their sequences. One pass suffices because the file is
+    grouped by trip: measured across all 106,058 trips in the real archive, no
+    trip's rows are ever interrupted by another's and at most one trip is open
+    at a time. So the rows of the trip in hand can be buffered — about
+    forty-four of them — and either kept or dropped the moment its last row
+    goes by. Nothing needs the whole file in memory.
+
+    The other half of the saving is not reading through `csv`. `DictReader`
+    builds a dict per row and costs 7.7s of a 7.9s pass; decompressing the
+    whole member is 0.26s of it, so the parsing, not the I/O or the zip, was
+    the expense. Splitting bytes and decoding only the 54,131 rows actually
+    kept takes the pass to 2.6s. Together: 16.0s to 2.9s for the whole
+    rebuild, with byte-identical output.
+
+    Splitting on commas is safe here despite `stop_headsign` being a quoted
+    free-text field — every row in the feed carries `""` for it — because the
+    split is bounded at the last column this reads and every column it reads
+    lies before that one. A comma inside the headsign can therefore only
+    disturb the remainder, which is discarded. If some future archive reorders
+    the columns so that stops being true, the scan hands off to `csv` rather
+    than quietly caching shifted times.
+    """
+    with zf.open("stop_times.txt") as raw:
+        header = raw.readline().decode("utf-8-sig").strip().split(",")
+        try:
+            idx = [header.index(c) for c in STOP_TIME_COLUMNS]
+        except ValueError as exc:
+            raise OSError(f"stop_times.txt has no {exc} column") from exc
+        i_trip, i_arr, i_dep, i_stop, i_seq = idx
+        limit = max(idx)
+        if "stop_headsign" in header and header.index("stop_headsign") < limit:
+            log.warning(
+                "stop_times.txt puts quoted text before a column we read; using csv"
+            )
+            return _scan_stop_times_csv(zf)
+
+        watched = {s.encode() for s in config.STOP_IDS}
+        trip_stops: TripStops = []
+        target: TargetCalls = {}
+        cur: bytes | None = None
+        buf: list[tuple[bytes, bytes, bytes, bytes]] = []
+        calls: list[tuple[bytes, bytes, bytes]] = []
+
+        def flush() -> None:
+            # Only trips that called at a watched stop are worth decoding, which
+            # is why the buffer holds raw bytes until this point: 1,135 trips of
+            # 106,058 survive, so 99% of the work is never done at all.
+            if cur is None or not calls:
+                return
+            trip_id = cur.decode()
+            target[trip_id] = [
+                (sid.decode(), int(seq), _parse_time_bytes(arr)) for sid, seq, arr in calls
+            ]
+            trip_stops.extend(
+                (
+                    trip_id,
+                    int(seq),
+                    sid.decode(),
+                    _parse_time_bytes(arr),
+                    _parse_time_bytes(dep),
+                )
+                for sid, seq, arr, dep in buf
+            )
+
+        tail = b""
+        while True:
+            chunk = raw.read(SCAN_CHUNK)
+            if not chunk:
+                break
+            lines = (tail + chunk).split(b"\n")
+            tail = lines.pop()
+            for line in lines:
+                if not line:
+                    continue
+                f = line.split(b",", limit + 1)
+                trip = f[i_trip]
+                if trip != cur:
+                    flush()
+                    cur, buf, calls = trip, [], []
+                stop = f[i_stop]
+                buf.append((stop, f[i_seq], f[i_arr], f[i_dep]))
+                if stop in watched:
+                    calls.append((stop, f[i_seq], f[i_arr]))
+        if tail.strip():
+            f = tail.split(b",", limit + 1)
+            trip = f[i_trip]
+            if trip != cur:
+                flush()
+                cur, buf, calls = trip, [], []
+            stop = f[i_stop]
+            buf.append((stop, f[i_seq], f[i_arr], f[i_dep]))
+            if stop in watched:
+                calls.append((stop, f[i_seq], f[i_arr]))
+        flush()
+    return trip_stops, target
+
+
+def _scan_stop_times_csv(zf: zipfile.ZipFile) -> tuple[TripStops, TargetCalls]:
+    """Correct-at-any-cost fallback for an archive the byte scan will not read.
+
+    Kept because the alternative to a slow rebuild is no rebuild: the cache is
+    only replaced once a scan succeeds, so raising here would leave the board
+    on a timetable that ages by a day for every day the layout stayed odd.
+    """
+    trip_stops: TripStops = []
+    target: TargetCalls = {}
+    for r in rows(zf, "stop_times.txt"):
+        trip_id, stop_id = r["trip_id"], r["stop_id"]
+        seq = int(r["stop_sequence"])
+        arr = parse_gtfs_time(r["arrival_time"])
+        trip_stops.append(
+            (trip_id, seq, stop_id, arr, parse_gtfs_time(r["departure_time"]))
+        )
+        if stop_id in config.STOP_IDS:
+            target.setdefault(trip_id, []).append((stop_id, seq, arr))
+    return [r for r in trip_stops if r[0] in target], target
+
+
 def build(force: bool = False) -> None:
     """Rebuild the timetable cache.
 
@@ -200,35 +344,12 @@ def _read_archive() -> Cache:
     """
     cache = Cache()
     with zipfile.ZipFile(config.GTFS_ZIP) as zf:
-        log.info("pass 1/2: finding trips that call at the watched stops")
-        target: dict[str, list[tuple[str, int, int | None]]] = {}
-        for i, r in enumerate(rows(zf, "stop_times.txt")):
-            if i and i % 2_000_000 == 0:
-                log.info("  %dM rows scanned, %d trips hit", i / 1e6, len(target))
-            if r["stop_id"] in config.STOP_IDS:
-                target.setdefault(r["trip_id"], []).append(
-                    (
-                        r["stop_id"],
-                        int(r["stop_sequence"]),
-                        parse_gtfs_time(r["arrival_time"]),
-                    )
-                )
-        log.info("%d trips call at the watched stops", len(target))
-
-        log.info("pass 2/2: collecting full stop sequences for those trips")
-        seq_rows = cache.trip_stops
-        for r in rows(zf, "stop_times.txt"):
-            if r["trip_id"] in target:
-                seq_rows.append(
-                    (
-                        r["trip_id"],
-                        int(r["stop_sequence"]),
-                        r["stop_id"],
-                        parse_gtfs_time(r["arrival_time"]),
-                        parse_gtfs_time(r["departure_time"]),
-                    )
-                )
-        log.info("%d stop_times found", len(seq_rows))
+        log.info("scanning stop_times.txt for trips calling at the watched stops")
+        seq_rows, target = _scan_stop_times(zf)
+        cache.trip_stops = seq_rows
+        log.info(
+            "%d trips call at the watched stops, %d stop_times", len(target), len(seq_rows)
+        )
 
         routes = {
             r["route_id"]: r.get("route_short_name") or r.get("route_long_name", "")
