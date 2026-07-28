@@ -8,7 +8,10 @@ without exposing the credential.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hashlib
+import re
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -23,6 +26,12 @@ from .matching import LONDON, Trip, load_trips, match
 STATIC = Path(__file__).parent / "static"
 log = logs.get("ontime.web")
 
+# What clients are told when a poll fails. The exception behind it names
+# container paths, SQL and driver internals; the board has no authentication by
+# design, so anyone who can reach it would read all of that. The full text goes
+# to the log, which is redacted and stays inside the container.
+POLL_ERROR = "Live data is temporarily unavailable."
+
 
 class State:
     """Everything the poller writes and the request handlers read."""
@@ -30,6 +39,7 @@ class State:
     def __init__(self) -> None:
         self.trips: list[Trip] = []
         self.trips_for: date | None = None
+        self.trips_built: str | None = None
         self.warned_empty_for: date | None = None
         self.segments: dict = {}
         self.board: dict = {"stops": [], "updated": None, "error": None}
@@ -41,8 +51,23 @@ class State:
 state = State()
 
 
+def _built_at(conn) -> str | None:
+    """The service date the cached timetable in this database was built for."""
+    row = conn.execute("SELECT value FROM meta WHERE key='built_at'").fetchone()
+    return row["value"] if row else None
+
+
 def refresh_timetable(conn) -> None:
-    """Reload the day's trips when the service date rolls over.
+    """Reload the day's trips when the date rolls over or the cache is rebuilt.
+
+    The date alone is not enough, for the same reason `refresh_segments` does
+    not use it. Both containers cross midnight together: this one polls every
+    15 seconds while the rebuild takes minutes, so it reliably reads the
+    pre-rebuild database, and keying the cache on the date alone would pin
+    yesterday's trips until the process next restarted. The `built_at` stamp
+    is written in the rebuild's own transaction, so it changes exactly when
+    the new trips become visible — and reading one indexed row is cheap
+    enough to do on every poll, which `load_trips` is not.
 
     An empty load is deliberately not cached. This process and the
     maintenance one start together, and against a cold volume the first
@@ -53,7 +78,8 @@ def refresh_timetable(conn) -> None:
     matches a trip, and both look exactly like a genuinely quiet evening.
     """
     today = datetime.now(LONDON).date()
-    if state.trips_for == today:
+    built = _built_at(conn)
+    if state.trips_for == today and state.trips_built == built:
         return
     days = (today, today - timedelta(days=1))
     trips = load_trips(conn, days)
@@ -65,12 +91,14 @@ def refresh_timetable(conn) -> None:
         return
     state.trips = trips
     state.trips_for = today
+    state.trips_built = built
     state.routes = {t.route_name for t in state.trips}
     log.info(
-        "timetable loaded: %d trips for %s, routes %s",
+        "timetable loaded: %d trips for %s, routes %s, cache built %s",
         len(state.trips),
         today,
         sorted(state.routes),
+        built,
     )
 
 
@@ -145,7 +173,12 @@ def build_board(conn) -> dict:
                         "minutes": round(p.minutes) if p.minutes is not None else None,
                         "eta_ts": p.eta_ts,
                         "sched_ts": p.sched_ts,
-                        "delay_mins": round(p.delay_secs / 60) if p.delay_secs else None,
+                        # `is not None`, not truthiness: a delay of exactly zero
+                        # is a bus running exactly to time, and the page reads
+                        # null as "not known" (see the confidence rule in eta).
+                        "delay_mins": (
+                            round(p.delay_secs / 60) if p.delay_secs is not None else None
+                        ),
                         "source": p.source,
                         "coverage": round(p.learned_coverage, 2),
                         "vehicle": p.vehicle_ref,
@@ -199,9 +232,10 @@ async def poll_and_store() -> None:
         c = state.board["counts"]
         log.info("poll: feed=%d matched=%d", c["feed"], c["matched"])
     except Exception as exc:  # a bad poll must not stop the loop
-        msg = config.redact(str(exc))
-        log.error("poll failed: %s", msg)
-        state.board = {**state.board, "error": msg}
+        # Detail stays in the log, which is redacted and never leaves the
+        # container; the board gets a fixed string. See POLL_ERROR.
+        log.exception("poll failed: %s", config.redact(str(exc)))
+        state.board = {**state.board, "error": POLL_ERROR}
 
 
 async def poller() -> None:
@@ -258,8 +292,47 @@ async def api_stops(_request: Request) -> JSONResponse:
     )
 
 
+def _inline_hashes(html: str, tag: str) -> list[str]:
+    """CSP hash sources for every inline `<tag>` block in the page."""
+    return [
+        "'sha256-" + base64.b64encode(hashlib.sha256(body.encode()).digest()).decode() + "'"
+        for body in re.findall(rf"<{tag}>(.*?)</{tag}>", html, re.DOTALL)
+    ]
+
+
+def content_security_policy(html: str) -> str:
+    """Lock the page down to exactly the script and stylesheet it ships with.
+
+    Hashing the inline blocks rather than allowing 'unsafe-inline' is the
+    whole point: with a hash source present the browser ignores
+    'unsafe-inline', so an `onerror=` handler smuggled in through a feed
+    field does not run even if something upstream forgets to escape it. The
+    hashes are computed from the file at import, so editing the page cannot
+    silently break it — and the page carries no inline style *attributes*,
+    which a hash cannot cover.
+    """
+    return "; ".join(
+        [
+            "default-src 'none'",
+            "script-src " + " ".join(_inline_hashes(html, "script")),
+            "style-src " + " ".join(_inline_hashes(html, "style")),
+            "connect-src 'self'",  # the page's own /api/board poll
+            "base-uri 'none'",
+            "form-action 'none'",
+            "frame-ancestors 'none'",
+        ]
+    )
+
+
+DASHBOARD = STATIC / "dashboard.html"
+CSP = content_security_policy(DASHBOARD.read_text())
+
+
 async def index(_request: Request) -> FileResponse:
-    return FileResponse(STATIC / "dashboard.html")
+    return FileResponse(
+        DASHBOARD,
+        headers={"Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff"},
+    )
 
 
 # Starlette rather than FastAPI. Nothing here uses a FastAPI feature — no

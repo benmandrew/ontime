@@ -58,6 +58,14 @@
 <footer id="foot"></footer>
 
 <script>
+// Route names, headsigns and destinations are the operator's text, passed
+// through by the server untouched, and every one of them lands in innerHTML
+// below. Escaping here is the only thing between a hostile DestinationName in
+// the feed and markup running in this page. The Content-Security-Policy the
+// server sets is the second line, not the first.
+const esc = s => String(s ?? '').replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+
 const fmtClock = ts => new Date(ts * 1000).toLocaleTimeString('en-GB',
   { hour: '2-digit', minute: '2-digit' });
 
@@ -72,8 +80,8 @@ function delayCell(d) {
   if (d.source === 'scheduled' || d.delay_mins === null) return '';
   if (Math.abs(d.delay_mins) < 2) return '<span class="early">on time</span>';
   return d.delay_mins > 0
-    ? `<span class="late">${d.delay_mins} late</span>`
-    : `<span class="early">${-d.delay_mins} early</span>`;
+    ? `<span class="late">${esc(d.delay_mins)} late</span>`
+    : `<span class="early">${esc(-d.delay_mins)} early</span>`;
 }
 
 function render(data) {
@@ -82,33 +90,37 @@ function render(data) {
   const tt = data.timetable || {};
   const noTimetable = !tt.date || !tt.trips;
   document.getElementById('err').innerHTML =
-    (data.error ? `<div class="err">${data.error}</div>` : '') +
+    (data.error ? `<div class="err">${esc(data.error)}</div>` : '') +
     (noTimetable ? `<div class="warn">No timetable loaded. The board is empty because
       the schedule has not been ingested yet, not because nothing is due.</div>` : '');
 
-  document.getElementById('grid').innerHTML = data.stops.map(s => `
+  document.getElementById('grid').innerHTML = (data.stops || []).map(s => `
     <div class="card">
-      <h2>${s.name}</h2>
-      <div class="sub">${s.detail} · <code>${s.naptan}</code> · <code>${s.atco}</code></div>
+      <h2>${esc(s.name)}</h2>
+      <div class="sub">${esc(s.detail)} · <code>${esc(s.naptan)}</code> · <code>${esc(s.atco)}</code></div>
       ${s.departures.length ? `
       <table>
-        <thead><tr><th>Svc</th><th>Towards</th><th>Status</th><th style="text-align:right">Due</th></tr></thead>
+        <thead><tr><th>Svc</th><th>Towards</th><th>Status</th><th class="due">Due</th></tr></thead>
         <tbody>${s.departures.map(d => `
           <tr>
-            <td class="route">${d.route}</td>
-            <td class="dest">${d.headsign || ''}
-              <span class="tag t-${d.source}">${d.source === 'scheduled' ? 'timetable' : d.source === 'learned' ? 'learned' : 'est'}</span>
+            <td class="route">${esc(d.route)}</td>
+            <td class="dest">${esc(d.headsign || '')}
+              <span class="tag t-${esc(d.source)}">${d.source === 'scheduled' ? 'timetable' : d.source === 'learned' ? 'learned' : 'est'}</span>
             </td>
             <td>${delayCell(d)}</td>
-            <td class="due">${due(d)}</td>
+            <td class="due">${esc(due(d))}</td>
           </tr>`).join('')}</tbody>
       </table>` : `<div class="empty">${noTimetable
         ? 'No timetable loaded.' : 'Nothing due within the horizon.'}</div>`}
     </div>`).join('');
 
-  const c = data.counts || {}, h = data.history || {};
-  document.getElementById('meta').textContent =
-    `updated ${fmtClock(data.updated)} · ${c.matched}/${c.feed} vehicles matched`;
+  const c = data.counts, h = data.history || {};
+  // A failed first poll leaves no counts and no timestamp. fmtClock(null)
+  // renders new Date(0) as a plausible-looking clock time, so a 1970 reading
+  // would sit there looking like a fresh board.
+  document.getElementById('meta').textContent = (c && data.updated)
+    ? `updated ${fmtClock(data.updated)} · ${c.matched}/${c.feed} vehicles matched`
+    : 'no data yet';
   document.getElementById('foot').textContent =
     `Timetable: ${noTimetable ? 'not loaded' :
       `${tt.trips.toLocaleString()} trips for ${tt.date} across ${tt.routes.length} routes`} · ` +

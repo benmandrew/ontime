@@ -97,7 +97,11 @@ USER ontime
 VOLUME ["/data"]
 EXPOSE 8000
 
+# The port is read from the environment rather than hardcoded: ONTIME_PORT is
+# an advertised override, and an exec-form CMD gets no shell to expand it, so a
+# literal 8000 here would mark a perfectly healthy container as unhealthy the
+# moment anyone used it.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-  CMD ["python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=4).status == 200 else 1)"]
+  CMD ["python", "-c", "import os,urllib.request,sys; url='http://127.0.0.1:'+os.getenv('ONTIME_PORT','8000')+'/healthz'; sys.exit(0 if urllib.request.urlopen(url, timeout=4).status == 200 else 1)"]
 
 CMD ["python", "-m", "ontime.web"]

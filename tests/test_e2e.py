@@ -7,14 +7,21 @@ here reaches BODS, so the suite runs offline and in the Nix sandbox.
 
 from __future__ import annotations
 
+import base64
+import dataclasses
+import hashlib
+import json
+import re
 import shutil
+import subprocess
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import requests
 from starlette.testclient import TestClient
 
-from ontime import config, db, history, ingest, web
+from ontime import config, db, eta, history, ingest, web
 from ontime.matching import LONDON
 
 from .conftest import (
@@ -55,6 +62,53 @@ def live_app(data_dir, feed, api_key, monkeypatch):
     ingest.build()
     monkeypatch.setattr(web, "state", web.State())
     return feed
+
+
+NODE = shutil.which("node")
+
+# The page's own script, run over a board payload with a stub document. Only
+# innerHTML and textContent are captured, because those two are the entire
+# boundary between server-supplied text and the DOM.
+RENDER_HARNESS = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.argv[2], 'utf8');
+const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
+const nodes = {};
+globalThis.document = {
+  getElementById: id => (nodes[id] = nodes[id] || { innerHTML: '', textContent: '' }),
+};
+// The page starts polling as it loads. Leaving that promise pending keeps the
+// render under test the only thing that writes to the stub document.
+globalThis.fetch = () => new Promise(() => {});
+globalThis.setInterval = () => 0;
+globalThis.__board = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+(0, eval)(script + '\nrender(__board);');
+const read = id => nodes[id] || { innerHTML: '', textContent: '' };
+process.stdout.write(JSON.stringify({
+  err: read('err').innerHTML,
+  grid: read('grid').innerHTML,
+  meta: read('meta').textContent,
+  foot: read('foot').textContent,
+}));
+"""
+
+
+def render_dashboard(board: dict, tmp_path: Path) -> dict:
+    """What the shipped page writes into the DOM for a given board payload."""
+    if not NODE:
+        pytest.skip("node is not installed")
+    harness = tmp_path / "harness.js"
+    harness.write_text(RENDER_HARNESS)
+    payload = tmp_path / "board.json"
+    payload.write_text(json.dumps(board))
+    out = subprocess.run(
+        [NODE, str(harness), str(web.DASHBOARD), str(payload)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    )
+    return json.loads(out.stdout)
 
 
 def board_for(client, atco: str) -> dict:
@@ -198,6 +252,63 @@ class TestLearningImprovesPredictions:
         assert after["minutes"] > before["minutes"]
 
 
+class TestDashboardRendering:
+    """The shipped page, driven under Node over payloads the server can produce."""
+
+    HOSTILE = "<img src=x onerror=alert(1)>"
+
+    def test_feed_text_cannot_execute_in_the_page(self, live_app, tmp_path):
+        """Every row was built by interpolating feed strings into innerHTML.
+
+        DestinationName is operator free text. It becomes `Prediction.headsign`
+        whenever the GTFS trip carries no headsign of its own — common in real
+        archives — and the board serialises it verbatim, so an `<img
+        src=x onerror=…>` in that field used to run in the browser.
+        """
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trip = load_trip(conn, any_trip_serving(conn, STOP_192), today)
+        target = next(i for i, s in enumerate(trip.stops) if s[1] == STOP_192)
+        conn.execute("UPDATE trips SET headsign = '' WHERE trip_id = ?", (trip.trip_id,))
+        conn.commit()
+        conn.close()
+
+        live_app["payload"] = siri_document(
+            [
+                vehicle_on_trip(trip, max(0, target - 2)).replace(
+                    "<DestinationName>Test_Destination</DestinationName>",
+                    "<DestinationName>&lt;img src=x onerror=alert(1)&gt;</DestinationName>",
+                )
+            ]
+        )
+        with TestClient(web.app) as client:
+            board = client.get("/api/board").json()
+
+        row = next(
+            d for s in board["stops"] for d in s["departures"] if d["vehicle"] == "TEST01"
+        )
+        assert row["headsign"] == self.HOSTILE, "the hostile text must reach the client"
+
+        grid = render_dashboard(board, tmp_path)["grid"]
+        assert "<img" not in grid, "feed text was rendered as markup"
+        assert self.HOSTILE not in grid
+        assert "&lt;img src=x onerror=alert(1)&gt;" in grid, "…but is still shown as text"
+
+    def test_a_failed_first_poll_renders_an_honest_empty_state(self, tmp_path):
+        """Before any successful poll the board has no counts and no timestamp.
+
+        `fmtClock(null)` computes `new Date(0)` and prints it as a plausible
+        clock time, so the header read `updated 01:00 · undefined/undefined
+        vehicles matched` — a 1970 reading dressed up as a fresh board.
+        """
+        out = render_dashboard(
+            {"stops": [], "updated": None, "error": web.POLL_ERROR}, tmp_path
+        )
+        assert out["meta"] == "no data yet"
+        assert "undefined" not in out["meta"]
+        assert web.POLL_ERROR in out["err"]
+
+
 class TestHttpApi:
     def test_index_serves_the_dashboard(self, live_app):
         with TestClient(web.app) as client:
@@ -229,19 +340,85 @@ class TestHttpApi:
             for path in ("/", "/api/board", "/api/stops", "/healthz"):
                 assert api_key not in client.get(path).text
 
-    def test_feed_failure_is_reported_without_the_key(self, live_app, api_key, monkeypatch):
+    def test_feed_failure_is_reported_without_internals(
+        self, live_app, api_key, monkeypatch, caplog
+    ):
+        """Both endpoints used to echo `str(exc)` to whoever asked.
+
+        The board has no authentication by design, so the exception text —
+        container paths, SQL fragments, driver internals — was readable by
+        anything that could reach the port. The detail belongs in the log.
+        """
+        detail = f"HTTPSConnectionPool /data/ontime.sqlite ?api_key={api_key}"
+
         def boom(*_a, **_k):
-            raise requests.RequestException(f"failed for ?api_key={api_key}")
+            raise requests.RequestException(detail)
 
         monkeypatch.setattr(requests, "get", boom)
-        with TestClient(web.app) as client:
+        with caplog.at_level("ERROR"), TestClient(web.app) as client:
             body = client.get("/api/board").json()
             health = client.get("/healthz")
 
-        assert body["error"]
-        assert api_key not in body["error"]
-        assert "<redacted>" in body["error"]
-        assert api_key not in health.text
+        assert body["error"] == web.POLL_ERROR
+        assert health.json()["error"] == web.POLL_ERROR
+        for text in (body["error"], health.text):
+            assert api_key not in text
+            assert "/data/ontime.sqlite" not in text
+            assert "HTTPSConnectionPool" not in text
+        assert "/data/ontime.sqlite" in caplog.text, "the detail must survive in the log"
+
+    def test_the_page_locks_itself_down_with_a_policy_it_satisfies(self, live_app):
+        """An escaping slip should not be one bug away from script execution.
+
+        A policy that allowed 'unsafe-inline' would be decoration, since that
+        is exactly what an injected event handler needs; hashing the blocks the
+        page ships with permits those two and nothing else. Recomputed here
+        from the served body, because a policy the page cannot satisfy is a
+        blank screen.
+        """
+        with TestClient(web.app) as client:
+            r = client.get("/")
+        csp = r.headers["content-security-policy"]
+
+        assert "default-src 'none'" in csp
+        assert "'unsafe-inline'" not in csp, "a hash source is ignored beside it"
+        assert "frame-ancestors 'none'" in csp
+        assert "connect-src 'self'" in csp, "the page polls its own /api/board"
+
+        for tag in ("script", "style"):
+            blocks = re.findall(rf"<{tag}>(.*?)</{tag}>", r.text, re.DOTALL)
+            assert blocks, f"expected an inline <{tag}> to hash"
+            for block in blocks:
+                digest = base64.b64encode(hashlib.sha256(block.encode()).digest()).decode()
+                assert f"'sha256-{digest}'" in csp, f"inline <{tag}> is not permitted"
+
+        # A hash covers a <style> element but never a style="" attribute.
+        assert 'style="' not in r.text
+
+    def test_a_bus_exactly_on_time_is_not_reported_as_unknown(self, live_app, monkeypatch):
+        """A delay of 0.0 is falsy, and null on this field means "not known".
+
+        So a bus running exactly to time rendered blank while one twenty
+        seconds late rendered "on time" — fact 15 read backwards.
+        """
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trip = load_trip(conn, any_trip_serving(conn, STOP_192), today)
+        target = next(i for i, s in enumerate(trip.stops) if s[1] == STOP_192)
+        live_app["payload"] = siri_document([vehicle_on_trip(trip, max(0, target - 5))])
+        conn.close()
+
+        predict = eta.predict
+
+        def exactly_on_time(*args, **kwargs):
+            p = predict(*args, **kwargs)
+            return dataclasses.replace(p, delay_secs=0.0) if p else p
+
+        monkeypatch.setattr(web.eta, "predict", exactly_on_time)
+        with TestClient(web.app) as client:
+            row = live_departure(client, STOP_192)
+
+        assert row["delay_mins"] == 0
 
 
 class TestColdStart:
@@ -291,6 +468,73 @@ class TestColdStart:
         assert body["timetable"]["trips"] > 0
         assert body["timetable"]["date"] == datetime.now(LONDON).date().isoformat()
         assert body["timetable"]["routes"]
+
+
+class TestNightlyRebuild:
+    """Both containers cross midnight together, and only one of them rebuilds.
+
+    The rebuild takes minutes; this process polls every 15 seconds. It
+    therefore reads the pre-rebuild database first, and caching that on the
+    date alone pinned yesterday's trips until the process next restarted.
+    """
+
+    def _stamp(self, conn, value: str) -> None:
+        conn.execute("INSERT OR REPLACE INTO meta VALUES ('built_at', ?)", (value,))
+        conn.commit()
+
+    def test_a_rebuilt_cache_supersedes_the_loaded_timetable(self, live_app):
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        self._stamp(conn, (today - timedelta(days=1)).isoformat())
+
+        web.refresh_timetable(conn)  # the poll that lands before the rebuild
+        stale = len(web.state.trips)
+        assert stale
+
+        dropped = web.state.trips[0].trip_id
+        conn.execute("DELETE FROM trips WHERE trip_id = ?", (dropped,))
+        self._stamp(conn, today.isoformat())
+
+        web.refresh_timetable(conn)
+        conn.close()
+
+        # One trip_id, two service days: the count drops by more than one.
+        assert len(web.state.trips) < stale
+        assert dropped not in {t.trip_id for t in web.state.trips}
+
+    def test_an_unchanged_cache_is_not_reloaded_on_every_poll(self, live_app, monkeypatch):
+        """`load_trips` reads every stop of every trip; it is not poll-cheap."""
+        conn = db.connect()
+        web.refresh_timetable(conn)
+        assert web.state.trips
+
+        calls = []
+        monkeypatch.setattr(web, "load_trips", lambda *a, **_k: calls.append(a) or [])
+        web.refresh_timetable(conn)
+        web.refresh_timetable(conn)
+        conn.close()
+
+        assert calls == []
+
+
+class TestContainerImage:
+    """The Dockerfile is part of the deliverable and nothing else checks it."""
+
+    def test_healthcheck_respects_the_configured_port(self):
+        """ONTIME_PORT is an advertised override; the probe hardcoded 8000.
+
+        An exec-form CMD has no shell to expand the variable, so anyone taking
+        the documented override got a container that ran perfectly and
+        reported itself unhealthy for ever.
+        """
+        dockerfile = Path(__file__).resolve().parent.parent / "Dockerfile"
+        # Comments stripped: a promise in prose is not a probe.
+        lines = [ln for ln in dockerfile.read_text().splitlines() if not ln.startswith("#")]
+        start = next(i for i, ln in enumerate(lines) if ln.startswith("HEALTHCHECK"))
+        probe = "\n".join(lines[start : start + 2])
+
+        assert "ONTIME_PORT" in probe
+        assert "127.0.0.1:8000" not in probe
 
 
 class TestResilience:
