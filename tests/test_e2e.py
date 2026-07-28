@@ -434,6 +434,32 @@ class TestHttpApi:
                 assert media in r.headers["content-type"]
                 assert r.headers["x-content-type-options"] == "nosniff"
 
+    def test_every_internal_link_and_script_resolves(self, live_app):
+        """A dead href fails in the browser and nowhere else.
+
+        Nothing else in this suite reads the pages' own markup for the paths it
+        points at, so a route renamed on one side of a link goes unnoticed
+        until someone clicks it. Both pages are walked rather than the board
+        alone, because the two link to each other and either direction can rot.
+        """
+        with TestClient(web.app) as client:
+            for page in ("/", "/segments"):
+                body = client.get(page).text
+                refs = set(re.findall(r'(?:href|src)="(/[^"]*)"', body))
+                assert refs, f"{page} points at nothing; the check is vacuous"
+                for ref in refs:
+                    assert client.get(ref).status_code == 200, f"{page} points at {ref}"
+
+    def test_the_two_pages_offer_a_way_to_reach_each_other(self, live_app):
+        """Resolving is not the same as existing: a deleted link resolves fine.
+
+        The segments page is reachable only from the board — it is in no menu
+        and nothing else advertises it — so losing the link strands it.
+        """
+        with TestClient(web.app) as client:
+            assert 'href="/segments"' in client.get("/").text, "the board strands /segments"
+            assert 'href="/"' in client.get("/segments").text, "no way back to the board"
+
     def test_everything_the_server_serves_is_packaged(self):
         """The image installs the package; it does not copy the tree.
 
