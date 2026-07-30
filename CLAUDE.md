@@ -143,21 +143,42 @@ memory, and it cut all three configurations by about a fifth.
     text can only corrupt the discarded remainder. A reordered header falls back to
     `csv` rather than caching shifted times — a failed rebuild means a board ageing
     by a day per day, so this path must never simply raise.
-20. **There is no published road geometry for these routes.** `shapes.txt` is
-    131MB unpacked (the 20.5MB in 4 is its *zipped* size), grouped by shape_id,
-    1.82s to scan — and worthless here: every watched trip carries an empty
-    `shape_id`, re-verified across all 2,730 that MANGTMGT reaches unrestricted
-    and so across the 1,261 actually cached, as do 70,155 of the feed's 111,484.
-    Do not scan it hoping for better. The map's route lines come from the stop
-    sequence instead (`web._route_lines`), one per route: the longest variant
-    covers every stop its route's other variants call at, bar two on the 192 —
-    and, since MANGTMGT, ten on the 41, whose Oxford Road workings and Swinton
-    Grove workings are different variants of one route. The line is context
-    beneath the pins, not a route diagram, so this is tolerable; the fix, were
-    it ever wanted, is a polyline per variant rather than per route.
-    Learned data cannot help — `segment_stats` holds run *times* and carries no
-    coordinate. The only true road geometry available is the `observations`
-    breadcrumb trail, which would need real work to clean.
+20. **BODS publishes no road geometry for these routes; OpenStreetMap does.**
+    `shapes.txt` is 131MB unpacked (the 20.5MB in 4 is its *zipped* size),
+    grouped by shape_id, 1.82s to scan — and worthless here: every watched trip
+    carries an empty `shape_id`, re-verified across all 2,730 that MANGTMGT
+    reaches unrestricted and so across the 1,261 actually cached, as do 70,155
+    of the feed's 111,484. Do not scan it hoping for better, and do not reopen
+    TransXChange for it either: `RouteLink/Track/Mapping` exists in the schema,
+    but operators [largely do not populate it](https://www.transportapi.com/blog/2023/04/bus-route-geometry-the-most-complete-and-accurate-gb-source/).
+    OpenStreetMap carries the same services as `type=route` relations built from
+    the roads. `scripts/build_route_shapes.py` matches them to the cached routes
+    offline and writes `static/route_shapes.json` (56KB); `ontime/geometry.py`
+    reads it and `web._route_lines` prefers it. **Nothing at runtime talks to
+    Overpass** — no key, no third-party host, no CSP change, and the ODbL credit
+    the tiles already carry covers the geometry too.
+    Match on proximity, never on `ref`. Querying the board's box for `ref=41`
+    returns a First Manchester service around Ashton whose stops sit a median
+    8,598m from anything the watched 41 calls at; the coverage gate drops it at
+    0.0% where the two genuine Go North West relations score 85.5% and 82.1%.
+    Across the 13 kept relations coverage runs 79.5–98.2% and the median stop
+    sits 13–21m from the line, against a 296m chord. One relation per direction
+    is what finally separates the 41's Oxford Road and Swinton Grove workings.
+    Two things bite when regenerating. **Relation way-chains have holes** — 33
+    of them, fifteen at ≤156m then nothing until 371m then kilometres — so
+    `MAX_BRIDGE_M` is 200m and the polyline is cut rather than drawn 8,670m
+    across Manchester. And **Ramer-Douglas-Peucker has no perpendicular for a
+    closed span**: a 41 roundabout taken the whole way round collapsed to two
+    identical points until the degenerate case was measured radially.
+    `test_no_polyline_has_collapsed_to_a_point` guards the artefact.
+    The 751 and the 797 have no relation in the box and keep the stop chords, so
+    `_route_lines` must go on supporting both sources. Learning geometry from
+    `observations` was considered and rejected: the trail is dense enough
+    (scheduled mean 3.80 m/s over 106,264 stop pairs is a breadcrumb every 57m
+    at a 15s poll, against a 296m chord) but it only covers `BBOX`, it trims at
+    21 days, and cleaning it is map-matching, which needs the road network that
+    OpenStreetMap was already going to hand over. `segment_stats` cannot help at
+    all — it holds run *times* and carries no coordinate.
 21. **The map's CSP is wider than the board's was, deliberately.** Leaflet is far
     too large to inline and hash, so `script-src`/`style-src` carry `'self'` —
     which makes every route this server answers a candidate `<script src>`. The
@@ -289,8 +310,12 @@ in 1MB chunks. 4MB chunks measured no faster and 27MB worse. (Both RSS figures a
 superseded by the pooling in 29, which was not applied when these were taken.) Cache 7.6MB · duty cycle
 <3% at a 15s poll · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured).
 Docker image 62.7MB (was 62.4MB before Leaflet's 162KB), non-root, no
-pip/fastapi/pydantic. `nix develop` ~10s. 312 tests (the recorded 216 was stale
-before this change; the fourth stop and its route limit added the rest).
+pip/fastapi/pydantic. `nix develop` ~10s. **310 tests** collected, 309 passing
+and 1 skipped — counted with `pytest`, not remembered; the recorded 216 and 312
+were both stale. The 19 in `tests/test_geometry.py` are the newest.
+`/api/map` carries 1,904 points in 44KB for a Thursday, against ~450 before the
+road geometry landed; the file behind it is 56KB and 2,540 points, fetched once
+on load rather than on the 10s poll.
 
 Adding MANGTMGT, measured on x86-64 Linux against the 2026-07-30 archive — three
 stops / four unrestricted / four with the 41 limit, same machine, same file, all

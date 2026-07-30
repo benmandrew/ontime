@@ -23,7 +23,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Route
 
-from . import config, db, eta, history, locking, logs, segments, siri
+from . import config, db, eta, geometry, history, locking, logs, segments, siri
 from .matching import LONDON, Trip, load_trips, match
 
 STATIC = Path(__file__).parent / "static"
@@ -115,33 +115,49 @@ def refresh_timetable(conn) -> None:
 
 
 def _route_lines(trips: list[Trip]) -> list[dict]:
-    """One polyline per route: the longest stop sequence any of its trips runs.
+    """Road geometry per route where OpenStreetMap has it, stop chords where not.
 
-    GTFS ships real road geometry in `shapes.txt`, but not for these operators.
-    Every one of the watched trips carries an empty `shape_id`, as do 63% of the
-    North West feed's 111,484 trips, so scanning that 131MB member would return
-    nothing for this board. The line is therefore drawn through the stops
-    themselves. Median stop spacing is 284m, which follows a straight road
-    closely and cuts the corner at a bend: it is context beneath the pins, not a
-    claim about which streets the bus uses.
+    GTFS ships real geometry in `shapes.txt`, but not for these operators: every
+    watched trip carries an empty `shape_id`, as do 63% of the North West feed's
+    111,484 trips. OpenStreetMap carries the same services as `type=route`
+    relations built from the roads themselves, so `ontime/geometry.py` ships
+    those instead, matched to routes offline by
+    `scripts/build_route_shapes.py`. Measured against the cached sequences, the
+    192's relation puts all 55 of its stops a median 16m from the line.
 
-    The longest variant per route is an approximation, and it degrades where one
-    route runs genuinely different workings. Across the nine cached routes the
-    longest variant covers everything its route's others call at, bar two stops
-    on the 192 — and ten on the 41, whose Oxford Road workings and Swinton Grove
-    workings share a number and little else. Drawing every variant would fix it
-    and clutter the map; a line that is context rather than a route diagram does
-    not earn that.
+    The fallback is what the map drew before, and it is still needed. Two of the
+    nine cached routes — the 751 and the 797, one trip each — have no relation
+    inside the board's bounding box, so their line is the longest stop sequence
+    any of their trips runs. A chord between stops is 296m at the median, which
+    follows a straight road well and cuts every corner; it is context beneath
+    the pins rather than a claim about which streets the bus uses.
+
+    Both branches may emit several entries for one route, and the page draws
+    each. OpenStreetMap supplies one relation per direction, which is how the
+    41's Oxford Road and Swinton Grove workings stop sharing a single line, and
+    a relation with a hole in its way chain is cut rather than bridged.
     """
+    published = geometry.route_lines()
+    lines: list[dict] = []
     longest: dict[str, Trip] = {}
     for t in trips:
+        if t.route_name in published:
+            continue
         best = longest.get(t.route_name)
         if best is None or len(t.stops) > len(best.stops):
             longest[t.route_name] = t
-    return [
-        {"route": name, "points": [[lat, lon] for _seq, _sid, _arr, lat, lon in trip.stops]}
-        for name, trip in sorted(longest.items())
-    ]
+    for name in sorted({t.route_name for t in trips}):
+        for points in published.get(name, ()):
+            lines.append({"route": name, "points": points})
+        trip = longest.get(name)
+        if trip is not None:
+            lines.append(
+                {
+                    "route": name,
+                    "points": [[lat, lon] for _seq, _sid, _arr, lat, lon in trip.stops],
+                }
+            )
+    return lines
 
 
 def refresh_stop_points(conn) -> None:

@@ -26,7 +26,7 @@ include = ["ontime*"]
 [tool.setuptools.package-data]
 # The image installs the package rather than copying the tree, so anything the
 # server serves has to be listed here or it exists only in the source checkout.
-ontime = ["static/*.html", "static/vendor/*"]
+ontime = ["static/*.html", "static/*.json", "static/vendor/*"]
 
 [tool.ruff]
 line-length = 92

@@ -93,8 +93,14 @@
       threshold matched a claim that can be made.
 - [ ] Run for a fortnight, then read the Δ column on `/segments` to see which
       segments the schedule gets wrong
-- [ ] Interpolate along the shape rather than snapping to the nearest stop —
-      `shapes.txt` is in the archive and currently unused
+- [ ] Interpolate along the route line rather than snapping to the nearest stop.
+      `shapes.txt` cannot supply the geometry — every watched trip's `shape_id`
+      is empty — but `ontime/geometry.py` now ships OpenStreetMap polylines for
+      seven of the nine routes, and a vehicle's distance *along* one of those is
+      a better progress measure than the index of the stop it is nearest.
+      Two things to settle first: the 751 and the 797 have no line at all, and
+      the polylines are cut where the relation's way-chain has holes, so
+      "distance along" is undefined across a break.
 - [ ] Confidence intervals on the board using the stored `p85_secs`
 - [ ] Cross-check a sample of predictions against bustimes.org to quantify error
 

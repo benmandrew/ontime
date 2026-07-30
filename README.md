@@ -8,9 +8,15 @@ The feed answers *where is the bus* and never *when will it reach my stop*. Ever
 
 ## The map
 
-Below the departure boards sits a map of the same data: a pin for each watched stop, and a dot for every vehicle the matcher has placed on a trip, rotated to the bearing the feed reports. Route lines run through each route's stop sequence rather than along the road, because every one of the 1,261 watched trips carries an empty `shape_id` and there is no published geometry to draw. Stop spacing has a median of 284m, so the line follows a straight road closely and cuts the corner at a bend.
+Below the departure boards sits a map of the same data: a pin for each watched stop, and a dot for every vehicle the matcher has placed on a trip, rotated to the bearing the feed reports. Route lines follow the road.
 
-One line is drawn per route, from the longest variant any of its trips runs, which is exact for seven of the nine routes cached. It is not exact for the 41, whose Oxford Road and Swinton Grove workings share a number and little else, so its line misses ten of the stops its shorter variants call at. The line is context beneath the pins rather than a route diagram, so it is left as it is.
+They did not always. The Bus Open Data Service (BODS) publishes none: every one of the 1,261 watched trips carries an empty `shape_id`, as do 70,155 of the North West feed's 111,484, and the *TransXChange* schema's geometry fields are mostly left empty by operators. So each route was drawn as a chain of straight hops between its stops, 296m at the median — close along a straight road, and wrong at every bend.
+
+OpenStreetMap carries the same services as `type=route` relations assembled from the roads themselves. `scripts/build_route_shapes.py` fetches them once, matches each to a cached route, and writes 56KB of polylines into the package; nothing at run time contacts the *Overpass* API. Across the thirteen relations kept, the median stop now sits 13–21m from its route's line.
+
+Relations are matched by proximity rather than by number, because numbers repeat. Asking for `ref=41` inside the board's bounding box returns a First Manchester service around Ashton whose stops lie a median 8,598m from anything the watched 41 touches; it is rejected for covering 0.0% of them, where the two genuine relations cover 85.5% and 82.1%. One relation per direction is also what finally separates the 41's Oxford Road workings from its Swinton Grove ones, which share a number and little else.
+
+Two routes keep the old straight lines. The 751 and the 797 run one trip each and have no relation inside the box, so `web._route_lines` falls back to the longest stop sequence their trips run. The same fallback covers a geometry file that is missing or malformed: the map loses its road detail and nothing else.
 
 The basemap is the one part of this application that talks to a third party. Tiles load from the server named in `ONTIME_MAP_TILE_URL`, and the page's *Content Security Policy* permits that origin and no other. Leaflet 1.9.4 is vendored under `ontime/static/vendor/` rather than loaded from a content delivery network, which costs 162KB in the image and removes a remote dependency from a dashboard that has to work when something else is down.
 
