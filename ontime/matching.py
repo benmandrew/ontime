@@ -87,9 +87,11 @@ class Trip:
         """(stop_id, scheduled arrival) for the watched stops this trip calls at.
 
         Built once per trip and kept, because `eta.scheduled_only` needs it on
-        every poll and only about one call in fifty is at a watched stop: across
-        the 890 trips the board loads, filtering `stops` inline meant walking
-        40,284 (trip, stop) pairs every fifteen seconds to reach 890 of them.
+        every poll and only about one call in forty-five is at a watched stop:
+        over one service day of the four-stop cache, filtering `stops` inline
+        meant walking 48,917 (trip, stop) pairs every fifteen seconds to reach
+        1,094 of them. A trip may appear more than once in the result — the 191
+        calls at two watched stops — so this is a list, not a single value.
         The trips themselves are reloaded only when the date rolls over or the
         cache is rebuilt, so this is paid once a day rather than 5,760 times.
         """
@@ -99,6 +101,7 @@ class Trip:
                 (stop_id, arr)
                 for _seq, stop_id, arr, _lat, _lon in self.stops
                 if stop_id in config.STOP_IDS
+                and config.stop_serves(stop_id, self.route_name)
             ]
             object.__setattr__(self, "_target_calls", cached)
         return cached
@@ -218,7 +221,7 @@ def _nearest(
     """Index and metres to the closest stop, reusing distances already measured.
 
     Every candidate for a vehicle is a trip on one route, so they walk largely
-    the same stops: 890 cached trips share about six hundred distinct ones. A
+    the same stops: 1,261 cached trips share just 309 distinct ones. A
     stop id has a single position, so its distance can be measured once per
     vehicle and looked up thereafter, which is what keeps the per-candidate
     direction test affordable.

@@ -27,8 +27,14 @@ SIRI_SAMPLE = FIXTURES / "siri_sample.xml"
 # Present in the fixture archive.
 STOP_192 = "1800EB06241"  # MANADTDW, Cavanagh Close
 STOP_50 = "1800SB13961"  # MANGPWTD, Swinton Grove
-# Watched but absent from the cut-down archive.
+# Five stops further along every 192 trip than STOP_192, and so the fixture's
+# way of putting two watched stops on one trip — which the real timetable does
+# for the 191, and did for nothing at all until MANGTMGT was added.
+STOP_192_DOWNSTREAM = "1800EB02551"  # Minshull Street South
+# Watched but absent from the cut-down archive: neither is served by the 192 or
+# the 50, the only two routes kept.
 STOP_ABSENT = "1800EB01881"  # MANADGMT, Hyde Grove
+STOP_ABSENT_2 = "1800SB30631"  # MANGTMGT, University Shopping Centre
 
 # Production reduces only the last 26 hours of positions, because older runs
 # have already been reduced. Tests seed history days back on purpose, so they

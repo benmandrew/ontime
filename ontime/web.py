@@ -119,15 +119,19 @@ def _route_lines(trips: list[Trip]) -> list[dict]:
 
     GTFS ships real road geometry in `shapes.txt`, but not for these operators.
     Every one of the watched trips carries an empty `shape_id`, as do 63% of the
-    North West feed's 106,058 trips, so scanning that 131MB member would return
+    North West feed's 111,484 trips, so scanning that 131MB member would return
     nothing for this board. The line is therefore drawn through the stops
     themselves. Median stop spacing is 284m, which follows a straight road
     closely and cuts the corner at a bend: it is context beneath the pins, not a
     claim about which streets the bus uses.
 
-    The longest variant per route is enough. Across the nine routes it covers
-    every stop their other variants call at, bar two on the 192 and two on the
-    53 — so a short working contributes nothing a rider would notice.
+    The longest variant per route is an approximation, and it degrades where one
+    route runs genuinely different workings. Across the nine cached routes the
+    longest variant covers everything its route's others call at, bar two stops
+    on the 192 — and ten on the 41, whose Oxford Road workings and Swinton Grove
+    workings share a number and little else. Drawing every variant would fix it
+    and clutter the map; a line that is context rather than a route diagram does
+    not earn that.
     """
     longest: dict[str, Trip] = {}
     for t in trips:
@@ -203,6 +207,12 @@ def build_board(conn) -> dict:
             }
         )
         for stop in config.STOPS:
+            # A restricted stop still lies on the path of trips cached for some
+            # other watched stop — the 191 passes University Shopping Centre on
+            # its way to Hyde Grove — so being here says nothing about whether
+            # this route belongs on this stop's board.
+            if not config.stop_serves(stop.atco, trip.route_name):
+                continue
             p = eta.predict(
                 v,
                 trip,

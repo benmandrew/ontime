@@ -11,7 +11,13 @@ import pytest
 
 from ontime import config, db, ingest
 
-from .conftest import MINI_GTFS, STOP_50, STOP_192, STOP_ABSENT
+from .conftest import (
+    MINI_GTFS,
+    STOP_50,
+    STOP_192,
+    STOP_192_DOWNSTREAM,
+    STOP_ABSENT,
+)
 
 
 class TestParseGtfsTime:
@@ -80,6 +86,126 @@ class TestBuild:
     def test_records_build_date(self, built_db):
         row = built_db.execute("SELECT value FROM meta WHERE key='built_at'").fetchone()
         assert row is not None
+
+    def test_the_scan_pools_repeated_values(self, data_dir):
+        """Identity, not equality — the point is that the rows share objects.
+
+        The scan sets the rebuild's high-water mark, and decoding every row in place
+        made one object per row for values drawn from a tiny set: against the
+        real archive, 128,208 `stop_id` strings for 583 distinct ones. Pooling
+        them took the peak from 68.2MB to 52.8MB with a byte-identical cache.
+        Equality would pass whether or not the pool exists, so this counts
+        objects.
+        """
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        with zipfile.ZipFile(config.GTFS_ZIP) as zf:
+            seq_rows, _target = ingest._scan_stop_times(zf)
+
+        assert len(seq_rows) > 1000, "fixture must be big enough for this to mean anything"
+        stop_ids = [r[2] for r in seq_rows]
+        assert len({id(s) for s in stop_ids}) == len(set(stop_ids))
+        times = [r[3] for r in seq_rows if r[3] is not None and r[3] > 256]
+        assert times, "fixture must carry times above the small-int cache"
+        assert len({id(t) for t in times}) == len(set(times))
+
+
+class TestPerStopRouteLimits:
+    """`Stop.routes` decides what is cached, not just what is displayed.
+
+    The point of restricting University Shopping Centre to the 41 is that the
+    other nineteen Oxford Road routes never enter the cache at all: 1,261 trips
+    against 2,730. A display-only filter would have paid the whole cost of the
+    corridor to hide it.
+    """
+
+    def _watch(self, monkeypatch, *stops: config.Stop) -> None:
+        monkeypatch.setattr(config, "STOPS", stops)
+        monkeypatch.setattr(config, "STOP_IDS", frozenset(s.atco for s in stops))
+        monkeypatch.setattr(config, "STOP_BY_ID", {s.atco: s for s in stops})
+
+    def _build(self, monkeypatch, *stops: config.Stop):
+        self._watch(monkeypatch, *stops)
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+        return db.connect()
+
+    def test_a_barred_route_is_never_cached(self, data_dir, monkeypatch):
+        """STOP_192 restricted to the 50, which does not run there.
+
+        Its trips have no other watched call, so the trips go too — sequences
+        and all, which is the whole saving.
+        """
+        conn = self._build(
+            monkeypatch,
+            config.Stop(STOP_192, "N1", "Restricted", "d", routes=frozenset({"50"})),
+            config.Stop(STOP_50, "N2", "Open", "d"),
+        )
+        try:
+            routes = {r["route_name"] for r in conn.execute("SELECT route_name FROM trips")}
+            assert routes == {"50"}
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) c FROM target_calls WHERE stop_id = ?", (STOP_192,)
+                ).fetchone()["c"]
+                == 0
+            )
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) c FROM trip_stops WHERE trip_id IN "
+                    "(SELECT trip_id FROM trips WHERE route_name = '192')"
+                ).fetchone()["c"]
+                == 0
+            )
+        finally:
+            conn.close()
+
+    def test_an_allowed_route_is_cached_as_normal(self, data_dir, monkeypatch):
+        """The positive control: naming the route that does run changes nothing."""
+        conn = self._build(
+            monkeypatch,
+            config.Stop(STOP_192, "N1", "Restricted", "d", routes=frozenset({"192"})),
+        )
+        try:
+            calls = conn.execute(
+                "SELECT COUNT(*) c FROM target_calls WHERE stop_id = ?", (STOP_192,)
+            ).fetchone()["c"]
+            assert calls == 15
+        finally:
+            conn.close()
+
+    def test_a_trip_keeps_its_other_watched_call(self, data_dir, monkeypatch):
+        """The 191's shape: barred at one watched stop, kept at another.
+
+        It runs through University Shopping Centre, restricted to the 41, and
+        on to Hyde Grove, which is open — so the trip must survive with one
+        call, not be dropped with both. Reproduced over the 192, whose trips
+        call at STOP_192 and then at STOP_192_DOWNSTREAM.
+        """
+        conn = self._build(
+            monkeypatch,
+            config.Stop(STOP_192, "N1", "Restricted", "d", routes=frozenset({"50"})),
+            config.Stop(STOP_192_DOWNSTREAM, "N2", "Open", "d"),
+        )
+        try:
+            rows = list(conn.execute("SELECT trip_id, stop_id FROM target_calls"))
+            assert len(rows) == 15, "the fifteen 192 trips survive"
+            assert {r["stop_id"] for r in rows} == {STOP_192_DOWNSTREAM}
+            # Still cached in full: the sequence runs through the barred stop.
+            assert (
+                conn.execute(
+                    "SELECT COUNT(*) c FROM trip_stops WHERE stop_id = ?", (STOP_192,)
+                ).fetchone()["c"]
+                == 15
+            )
+        finally:
+            conn.close()
+
+    def test_no_limits_anywhere_is_a_no_op(self, data_dir, monkeypatch):
+        """The unrestricted path must not change while this feature exists."""
+        target: ingest.TargetCalls = {"t1": [(STOP_192, 4, 100)]}
+        self._watch(monkeypatch, config.Stop(STOP_192, "N1", "Open", "d"))
+        assert ingest._apply_route_limits(target, {"t1": "192"}) == 0
+        assert target == {"t1": [(STOP_192, 4, 100)]}
 
 
 def competing_write() -> Exception | None:

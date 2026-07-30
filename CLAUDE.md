@@ -1,16 +1,32 @@
 # ontime — project memory
 
-Private live-departures dashboard for three Manchester bus stops, built on the DfT Bus Open Data Service (BODS). Full detail in @README.md; current state in @PLAN.md.
+Private live-departures dashboard for four Manchester bus stops, built on the DfT Bus Open Data Service (BODS). Full detail in @README.md; current state in @PLAN.md.
 
 ## Watched stops (set in `ontime/config.py`)
 
-| NaPTAN | ATCO | Stop | Services |
+| NaPTAN | ATCO | Stop | Watched services (trips in the archive) |
 |---|---|---|---|
-| MANADGMT | 1800EB01881 | Hyde Grove, Plymouth Grove (W) | 50, 197, 53, 41, 191, 51 |
-| MANGPWTD | 1800SB13961 | Swinton Grove, Upper Brook St (Stop L) | 50, 197, 53, 41, 191, 51 |
-| MANADTDW | 1800EB06241 | Cavanagh Close, Stockport Rd (NW) | 192 only |
+| MANADGMT | 1800EB01881 | Hyde Grove, Plymouth Grove (W) | 197:83, 191:13, 797:1 |
+| MANGPWTD | 1800SB13961 | Swinton Grove, Upper Brook St (Stop L) | 50:226, 41:18, 53:12, 51:7, 751:1 |
+| MANADTDW | 1800EB06241 | Cavanagh Close, Stockport Rd (NW) | 192:762 |
+| MANGTMGT | 1800SB30631 | University Shopping Centre, Oxford Rd (Stop C) | **41 only** (138), by `Stop.routes` |
 
-1,135 scheduled calls/day total; the 192 is 762 of them.
+1,261 scheduled calls across 1,261 trips and 9 routes; the 192 is 762 of them.
+Counts measured against the archive downloaded 2026-07-30; they drift as operators
+republish, and the older three-stop table overstated which services reach Hyde Grove
+and Swinton Grove by the time it was re-measured.
+
+**Oxford Road is a corridor, and `Stop.routes` is why watching one stop on it is
+affordable.** Unrestricted it would cache 2,730 trips on 20 routes against 1,123 on 9
+before the stop existed — the 41 alone brings it to 1,261 on the same 9 routes, because
+the 41 already served Swinton Grove. Measured three stops / four unrestricted / four
+with the 41 limit: `trip_stops` 53,183 / 128,208 / **64,577** rows, cache 7.5MB / 18MB /
+**9.1MB**, `load_trips` 107 / 248 / **142**ms, `_scheduled_cells` 225 / 545 / **280**ms,
+segment buckets 6,736 / 24,880 / **9,199**, rebuild peak RSS 45.7 / 58.5 / **53.2**MB.
+
+The limit recovers little of the peak — 58.5MB to 53.2MB — because it cannot be applied
+until after the scan that sets it (see 29). Pooling inside the scan is what actually cut
+memory, and it cut all three configurations by about a fifth.
 
 ## Hard-won facts — do not rediscover these
 
@@ -117,7 +133,11 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     (~44 rows) and keeps it only if it called at a watched stop, which replaced two
     full passes. It also splits bytes instead of using `csv.DictReader`, which was
     7.7s of a 7.9s pass — decompressing the whole 398MB member is 0.26s, so parsing
-    was the cost, never the zip or the I/O. Only the 54,131 rows kept get decoded.
+    was the cost, never the zip or the I/O. Only the rows kept get decoded — 128,208
+    of 4,746,378 at four stops, against 53,183 at three, which is why the scan grew
+    only 3.00s to 3.27s when the watched set went up by a factor of 2.4. Those are
+    the scan's own figures, before `_apply_route_limits` prunes them to 64,577; the
+    scan cannot apply a route limit because `stop_times.txt` has no route column.
     Every row carries a quoted `stop_headsign`; the split is bounded at the last
     column read and every column read precedes it, so a comma in that operator free
     text can only corrupt the discarded remainder. A reordered header falls back to
@@ -125,11 +145,16 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     by a day per day, so this path must never simply raise.
 20. **There is no published road geometry for these routes.** `shapes.txt` is
     131MB unpacked (the 20.5MB in 4 is its *zipped* size), grouped by shape_id,
-    1.82s to scan — and worthless here: all 1,135 watched trips carry an empty
-    `shape_id`, as do 66,967 of the feed's 106,058. Do not scan it hoping for
-    better. The map's route lines come from the stop sequence instead
-    (`web._route_lines`), one per route: the longest variant covers every stop
-    its route's other variants call at, bar two on the 192 and two on the 53.
+    1.82s to scan — and worthless here: every watched trip carries an empty
+    `shape_id`, re-verified across all 2,730 that MANGTMGT reaches unrestricted
+    and so across the 1,261 actually cached, as do 70,155 of the feed's 111,484.
+    Do not scan it hoping for better. The map's route lines come from the stop
+    sequence instead (`web._route_lines`), one per route: the longest variant
+    covers every stop its route's other variants call at, bar two on the 192 —
+    and, since MANGTMGT, ten on the 41, whose Oxford Road workings and Swinton
+    Grove workings are different variants of one route. The line is context
+    beneath the pins, not a route diagram, so this is tolerable; the fix, were
+    it ever wanted, is a polyline per variant rather than per route.
     Learned data cannot help — `segment_stats` holds run *times* and carries no
     coordinate. The only true road geometry available is the `observations`
     breadcrumb trail, which would need real work to clean.
@@ -169,8 +194,13 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     in the stats table. **A 95% interval for a median needs n ≥ 6**: order
     statistics give at best [min, max], covering with probability 1 − 2/2ⁿ, so
     `MIN_SAMPLES = 5` is one short of supporting the claim it implies.
-    **Coverage needs a timetable denominator**, not an observed one: 6,771
-    buckets are implied, 3.0% seen. Do not compute the CI parametrically —
+    **Coverage needs a timetable denominator**, not an observed one, and that
+    denominator moved when MANGTMGT was added: 6,736 buckets implied on a weekday
+    cache at three stops, 24,880 at four unrestricted, 9,199 under the 41 limit,
+    with adjacencies going 420 / 1,046 / 431. The reported coverage percentage
+    therefore fell by about a third on the day the stop landed, with nothing lost
+    — read a drop across that boundary as a bigger timetable, not as a
+    regression. Do not compute the CI parametrically —
     traversal times are bounded below by the road and unbounded above by
     traffic. `_scheduled_cells` returns adjacency *separately* from gaps:
     published times round to the minute, so a short hop is often timetabled at
@@ -196,15 +226,83 @@ Private live-departures dashboard for three Manchester bus stops, built on the D
     (45.7h span, 44.6h of it silent), so its skipped share is not the
     deployment's.
 
-## Measured baselines (Apple silicon, real data)
+27. **A trip can call at more than one watched stop — and today none does.**
+    True of no cached trip before MANGTMGT, true of 14 of 2,730 with it
+    unrestricted (the 13 191s and one 797, each calling at Hyde Grove and then
+    at University Shopping Centre), and false again under the 41 limit, which
+    drops the 191's Oxford Road call and leaves 1,261 trips holding 1,261 calls.
+    Do not read that 1:1 as a guarantee. Lifting the limit, widening it, or
+    adding another corridor stop brings it straight back, so the capability is
+    tested regardless: `TestTripServingTwoWatchedStops` in `tests/test_e2e.py`
+    reproduces it over the 192, the 191 being absent from the cut-down fixture.
+    Nothing had to change to support it — the `target_calls` primary key is
+    (trip_id, stop_id), `Trip.target_calls` is a list, `eta.predict` is asked
+    once per watched stop — but anything that keys a trip's watched call as a
+    single value, or stops at the first one it finds, will silently empty one
+    stop's board. Note also that `eta.predict` deliberately scans for the
+    *first* occurrence of the target rather than reading `trip.index_of`, which
+    holds the last — no cached trip calls at one watched stop twice, so the two
+    agree, but they would not on a loop route.
+
+28. **A per-stop route limit has to hold in three places, not one.** Dropping
+    barred trips at ingest is necessary and not sufficient, because a trip
+    cached for an *open* watched stop still runs through the restricted one:
+    13 real 191 trips pass University Shopping Centre every weekday on their
+    way to Hyde Grove, are matched, and sit in `state.trips`. Without a guard
+    both `eta.predict` (via `web.build_board`) and `eta.scheduled_only` (via
+    `Trip.target_calls`) will place them at a stop that bars them. All three
+    read `config.stop_serves`, which exists so they cannot disagree. Verified
+    against the real archive: 152 cached trips still pass through that stop,
+    only 138 of them call there, and the board shows 41s and nothing else.
+
+29. **The scan sets the rebuild's high-water mark; nothing after it comes close.**
+    Measured with `VmHWM` at each stage: 34MB at import, 67.7MB the moment
+    `_scan_stop_times` returns, and unchanged through `_apply_route_limits`, the
+    `by_trip` duplicate and the inserts — later stages reuse memory the prune
+    freed. Two consequences. Optimising anything downstream of the scan buys
+    nothing, which is why the 12.4MB `by_trip` duplicate is still there and can
+    stay. And a per-stop route limit cannot help much, because the rows it drops
+    were already accumulated.
+    What did help was pooling the two values the scan repeats. Decoding in place
+    made one object per row from a tiny set of values: **128,208 `stop_id`
+    strings for 583 distinct ones**, plus an int per arrival and departure drawn
+    from a few thousand distinct times. A `dict` keyed on the raw bytes took the
+    rebuild from 68.2MB to **52.8MB** — 23% — with the cache byte-identical
+    (fingerprint over every row of all six tables, unchanged) and the rebuild
+    marginally *faster*, a dict hit beating decode-and-parse. `test_the_scan_pools_
+    repeated_values` asserts on `id()`, not equality, because equality passes
+    whether the pool exists or not.
+    What is left is the floor: 128,208 five-tuples cost about 11MB in tuple
+    headers and list slots however cheap their contents are. Cutting that needs a
+    different data structure (parallel `array`s, say), not a smaller value — and
+    at 53MB nothing is asking for it. Beware measuring this with `tracemalloc`:
+    its bookkeeping added more than the allocations under study, and an earlier
+    figure of 82MB was an artefact of a script that ran the scan twice and held
+    both results.
+
+## Measured baselines (Apple silicon unless noted, real data)
 
 Rebuild **2.16s** against the real 89.4MB archive (was 17.29s two-pass), the write
 lock held for 0.09s of it — the scan runs before a connection opens, which is why the
 board no longer 502s nightly. Scan peak RSS 68MB, up from 62MB: the cost of reading
-in 1MB chunks. 4MB chunks measured no faster and 27MB worse. Cache 7.6MB · duty cycle
+in 1MB chunks. 4MB chunks measured no faster and 27MB worse. (Both RSS figures are
+superseded by the pooling in 29, which was not applied when these were taken.) Cache 7.6MB · duty cycle
 <3% at a 15s poll · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured).
 Docker image 62.7MB (was 62.4MB before Leaflet's 162KB), non-root, no
-pip/fastapi/pydantic. `nix develop` ~10s. 216 tests in ~4s.
+pip/fastapi/pydantic. `nix develop` ~10s. 312 tests (the recorded 216 was stale
+before this change; the fourth stop and its route limit added the rest).
+
+Adding MANGTMGT, measured on x86-64 Linux against the 2026-07-30 archive — three
+stops / four unrestricted / four with the 41 limit, same machine, same file, all
+after the scan pooling in 29: full rebuild 3.16 / 3.27 / **3.17**s, peak RSS 45.7 /
+58.5 / **53.2**MB, cache 7.5 / 18 / **9.1**MB, `load_trips` for a service day 107 /
+248 / **142**ms, `segments._scheduled_cells` 225 / 545 / **280**ms. Rebuild time
+barely moves in any configuration, because it is a full pass over 4,746,378 rows
+either way. The Apple-silicon figures above are not comparable and were left alone.
+
+Peak RSS before the pooling was 52.6 / 74.1 / 68.3MB, so the fourth stop now costs
+about 7MB of peak against the three-stop configuration rather than 16MB, and the
+whole four-stop rebuild sits below where three stops used to.
 
 Matching 20 fixture vehicles: 3.35ms before memoisation, **2.00ms** after. Sharing one
 haversine per stop id already made the trigonometry cheap — 191 calls — but `_nearest`

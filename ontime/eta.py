@@ -95,7 +95,7 @@ def predict(
 
     `pos_idx` is the vehicle's closest stop on this trip, which `match` has
     already had to work out; passing it through skips re-measuring the whole
-    stop sequence once per watched stop, three times over per vehicle, for an
+    stop sequence once per watched stop, four times over per vehicle, for an
     answer that cannot differ. Callers without a `Match` in hand — the tests
     and the benchmark — leave it out and it is measured here as before.
     """
@@ -190,8 +190,10 @@ def scheduled_only(
         if trip.trip_id in matched_trip_ids:
             continue
         # `trip.target_calls`, not a filter over `trip.stops`: only about one
-        # call in fifty is at a watched stop, so scanning the full sequence
-        # walked 40,284 (trip, stop) pairs every poll to reach 890 of them.
+        # call in forty-five is at a watched stop, so scanning the full sequence
+        # walked 48,917 (trip, stop) pairs every poll to reach 1,094 of them —
+        # and that is one service day of the four-stop cache, where the board
+        # loads two.
         for stop_id, arr in trip.target_calls:
             ts = sched_timestamp(trip, arr)
             if ts is None or not (now - 60 <= ts <= now + horizon):

@@ -48,6 +48,27 @@
       484 learned buckets pair two stops the timetable never runs consecutively,
       so the predictor has no key that could ever reach them.
 
+- [x] Added a fourth watched stop, MANGTMGT / `1800SB30631` — University Shopping
+      Centre, Oxford Road (Stop C) — and restricted it to the 41. Unrestricted it
+      would have taken the cache from 1,123 trips on 9 routes to 2,730 on 20,
+      because Oxford Road is a corridor rather than a side street; the 41 alone
+      brings it to 1,261 on the same 9 routes. `Stop.routes` filters the *cache*,
+      not the page, so the other nineteen corridor routes are never matched,
+      predicted or learned from. Measured against the real archive: `trip_stops`
+      53,183 → 64,577, `load_trips` 107 → 142ms, segment denominator 6,736 →
+      9,199. The limit has to hold in three places — ingest, `Trip.target_calls`
+      and `web.build_board` — because 13 real 191 trips still run through the
+      stop on their way to Hyde Grove and would otherwise appear on its board.
+
+- [x] Cut rebuild peak RSS 68.2MB → 52.8MB (23%) by pooling the two values the
+      scan repeats: 128,208 `stop_id` strings stood for 583 distinct ones, and
+      one int was allocated per arrival and departure from a few thousand
+      distinct times. The cache is byte-identical and the rebuild is marginally
+      faster. Profiling first showed the high-water mark is set inside the scan
+      and never moved again, so nothing downstream was worth touching — the
+      12.4MB `by_trip` duplicate can stay. `tracemalloc` was useless here: its
+      own bookkeeping cost more than the allocations being measured.
+
 ## In progress
 
 - [ ] Nothing. Waiting on history to accumulate.

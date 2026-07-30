@@ -282,9 +282,9 @@ function updateMap(data) {
   //
   // On the stops, not on the buses. The feed's bounding box reaches twenty
   // minutes upstream, so fitting to both zoomed out to the whole of Greater
-  // Manchester and left the three stops an unreadable speck in the middle —
-  // the buses were visible and the thing the board is about was not. maxZoom
-  // stops the opposite failure, where three stops a few hundred metres apart
+  // Manchester and left the stops an unreadable speck in the middle — the
+  // buses were visible and the thing the board is about was not. maxZoom
+  // stops the opposite failure, where four stops spanning 1.0km end to end
   // fill the frame at street level.
   if (!framed) {
     const pts = (stops.length ? stops : buses).map(p => [p.lat, p.lon]);

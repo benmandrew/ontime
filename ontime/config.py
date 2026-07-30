@@ -34,6 +34,14 @@ class Stop:
     naptan: str
     name: str
     detail: str
+    # Services to watch here. None means every route that calls at the stop.
+    #
+    # This is a filter on the *timetable cache*, not on the rendered page: a
+    # restricted route's trips are never cached, so they are never matched,
+    # never predicted and never learned from. That matters because a corridor
+    # stop otherwise drags its whole corridor in — watching all of Oxford Road
+    # cost 2,730 cached trips against 1,261 for the 41 alone.
+    routes: frozenset[str] | None = None
 
 
 # The stops this dashboard watches. ATCO codes resolved from NaPTAN area 180.
@@ -41,10 +49,35 @@ STOPS: tuple[Stop, ...] = (
     Stop("1800EB01881", "MANADGMT", "Hyde Grove", "Plymouth Grove, westbound"),
     Stop("1800SB13961", "MANGPWTD", "Swinton Grove", "Upper Brook Street, Stop L"),
     Stop("1800EB06241", "MANADTDW", "Cavanagh Close", "Stockport Road, northwest-bound"),
+    Stop(
+        "1800SB30631",
+        "MANGTMGT",
+        "University Shopping Centre",
+        "Oxford Road, Stop C",
+        routes=frozenset({"41"}),
+    ),
 )
 
 STOP_IDS: frozenset[str] = frozenset(s.atco for s in STOPS)
 STOP_BY_ID: dict[str, Stop] = {s.atco: s for s in STOPS}
+
+
+def stop_serves(atco: str, route_name: str) -> bool:
+    """Whether this route's departures belong on this stop's board.
+
+    The single place the `Stop.routes` restriction is interpreted, because it
+    has to hold in three of them and they must agree. `ingest` applies it when
+    deciding what to cache; `Trip.target_calls` applies it so a trip cached for
+    one watched stop does not advertise itself at a restricted one it happens
+    to pass; `web.build_board` applies it to live vehicles for the same reason.
+    Drop any of the three and a restricted stop leaks the route back — the 191
+    runs through University Shopping Centre on its way to Hyde Grove, so its
+    trips are cached whatever this says.
+    """
+    stop = STOP_BY_ID.get(atco)
+    if stop is None:
+        return False
+    return stop.routes is None or route_name in stop.routes
 
 
 def _env_float_list(name: str, default: str) -> tuple[float, ...]:

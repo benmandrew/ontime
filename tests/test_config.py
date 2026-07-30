@@ -45,9 +45,14 @@ class TestRedact:
 
 
 class TestStops:
-    def test_three_stops_are_watched(self):
-        assert len(config.STOPS) == 3
-        assert {s.naptan for s in config.STOPS} == {"MANADGMT", "MANGPWTD", "MANADTDW"}
+    def test_four_stops_are_watched(self):
+        assert len(config.STOPS) == 4
+        assert {s.naptan for s in config.STOPS} == {
+            "MANADGMT",
+            "MANGPWTD",
+            "MANADTDW",
+            "MANGTMGT",
+        }
 
     def test_atco_codes_are_greater_manchester(self):
         """ATCO area 180 is Greater Manchester."""
@@ -56,6 +61,28 @@ class TestStops:
     def test_lookup_tables_agree(self):
         assert frozenset(config.STOP_BY_ID) == config.STOP_IDS
         assert len(config.STOP_IDS) == len(config.STOPS)
+
+
+class TestStopServes:
+    """`Stop.routes` restricts a stop to named services; None watches all."""
+
+    def test_an_unrestricted_stop_serves_everything(self):
+        stop = next(s for s in config.STOPS if s.routes is None)
+        assert config.stop_serves(stop.atco, "192")
+        assert config.stop_serves(stop.atco, "anything at all")
+
+    def test_a_restricted_stop_serves_only_its_own_routes(self):
+        """University Shopping Centre is the whole of Oxford Road otherwise."""
+        usc = config.STOP_BY_ID["1800SB30631"]
+        assert usc.routes == frozenset({"41"})
+        assert config.stop_serves(usc.atco, "41")
+        for other in ("143", "43", "142", "191"):
+            assert not config.stop_serves(usc.atco, other)
+
+    def test_an_unwatched_stop_serves_nothing(self):
+        """Not merely False for tidiness: `Trip.target_calls` asks about every
+        stop on a trip, most of which are not watched at all."""
+        assert not config.stop_serves("1800EB99999", "41")
 
 
 class TestBoundingBox:
@@ -71,6 +98,7 @@ class TestBoundingBox:
             (53.464085, -2.222301),
             (53.46225, -2.223839),
             (53.4674, -2.219859),
+            (53.467531, -2.234924),
         ):
             assert min_lat < lat < max_lat
             assert min_lon < lon < max_lon

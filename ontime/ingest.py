@@ -4,9 +4,10 @@ The published archive is about 89MB zipped and 544MB unpacked, with
 `stop_times.txt` alone accounting for 398MB. Nothing is unpacked to disk and
 no file is read whole into memory: every pass streams rows out of the zip.
 
-Two passes over `stop_times.txt` are needed. The first finds which trips call
-at a watched stop; the second collects the complete stop sequence for exactly
-those trips, which is what the arrival estimator walks.
+One pass over `stop_times.txt` does both jobs. The file is grouped by trip, so
+the scan buffers the trip in hand and keeps its complete stop sequence — which
+is what the arrival estimator walks — only once a row shows it calling at a
+watched stop. Two passes were needed before that grouping was verified.
 
 The scan is deliberately separated from the write. What survives the scan is a
 few tens of thousands of tuples out of four million rows, so it costs little to
@@ -149,7 +150,10 @@ STOP_TIME_COLUMNS = (
 )
 
 # Read size for the byte scan. 1MB measured 2.62s at 72MB peak RSS against the
-# real archive; 4MB was no faster and cost 27MB more.
+# real archive; 4MB was no faster and cost 27MB more. Those absolute figures
+# predate the value pooling in `_scan_stop_times`, which cut the peak by a fifth
+# without touching the chunk size; the comparison between the two sizes is what
+# this constant rests on, and that has not been re-run.
 SCAN_CHUNK = 1 << 20
 
 TripStops = list[tuple[str, int, str, int | None, int | None]]
@@ -208,23 +212,45 @@ def _scan_stop_times(zf: zipfile.ZipFile) -> tuple[TripStops, TargetCalls]:
         buf: list[tuple[bytes, bytes, bytes, bytes]] = []
         calls: list[tuple[bytes, bytes, bytes]] = []
 
+        # The scan sets the rebuild's high-water mark — the prune and everything
+        # after it run under a smaller footprint and never exceed it — so the
+        # only allocations that matter are the ones below, once per kept row.
+        #
+        # Decoding in place made a fresh object every time: 128,208 `stop_id`
+        # strings for 583 distinct values, and an int per arrival and departure
+        # drawn from a few thousand distinct times. Both are pooled instead. The
+        # keys are the raw bytes, which are transient, and the values are what
+        # the rows then share.
+        stop_pool: dict[bytes, str] = {}
+        time_pool: dict[bytes, int | None] = {}
+
+        def pooled_time(raw: bytes) -> int | None:
+            hit = time_pool.get(raw)
+            if hit is None and raw not in time_pool:
+                hit = time_pool[raw] = _parse_time_bytes(raw)
+            return hit
+
         def flush() -> None:
             # Only trips that called at a watched stop are worth decoding, which
-            # is why the buffer holds raw bytes until this point: 1,135 trips of
-            # 106,058 survive, so 99% of the work is never done at all.
+            # is why the buffer holds raw bytes until this point: 2,730 trips of
+            # 111,484 survive the scan, so 98% of the work is never done at all.
+            # Per-stop route limits cut that again, to 1,261, but only afterwards
+            # — `_apply_route_limits` needs a route and this file has no column
+            # for one.
             if cur is None or not calls:
                 return
             trip_id = cur.decode()
             target[trip_id] = [
-                (sid.decode(), int(seq), _parse_time_bytes(arr)) for sid, seq, arr in calls
+                (stop_pool.setdefault(sid, sid.decode()), int(seq), pooled_time(arr))
+                for sid, seq, arr in calls
             ]
             trip_stops.extend(
                 (
                     trip_id,
                     int(seq),
-                    sid.decode(),
-                    _parse_time_bytes(arr),
-                    _parse_time_bytes(dep),
+                    stop_pool.setdefault(sid, sid.decode()),
+                    pooled_time(arr),
+                    pooled_time(dep),
                 )
                 for sid, seq, arr, dep in buf
             )
@@ -305,8 +331,9 @@ def build(force: bool = False) -> None:
                 f"{locking.STALE_AFTER_SECS}s. Pass --force to override."
             )
     # Held for the whole build, not stamped once at the start. The scan measures
-    # 17.2s against the real archive on Apple silicon, comfortably inside the
-    # 90s staleness window — but that is one machine with a warm page cache, and
+    # a few seconds against the real archive — 2.16s on Apple silicon, 3.27s on
+    # x86-64 Linux at four watched stops — comfortably inside the 90s staleness
+    # window, but those are warm-page-cache figures on two machines, and
     # `run_learn` under the same guard grows with the observation count rather
     # than the archive. A record that refreshes cannot age out of any of them.
     with locking.writing("ingest"):
@@ -331,10 +358,37 @@ class Cache:
     target_calls: list[tuple[str, str, int, int | None]] = field(default_factory=list)
 
 
+def _apply_route_limits(target: TargetCalls, trip_route: dict[str, str]) -> int:
+    """Drop watched calls a stop's `Stop.routes` does not admit. Returns trips lost.
+
+    Mutates `target` in place and removes any trip left with no watched call at
+    all — those are exactly the trips the cache exists to hold, so a trip that
+    reaches a watched stop only on a barred route is of no further use and its
+    whole stop sequence goes with it.
+
+    A trip is *not* dropped merely because one of its calls was barred. The 191
+    runs through University Shopping Centre, restricted to the 41, and on to
+    Hyde Grove, which is unrestricted: it loses the first call and keeps the
+    second, so it still appears on Hyde Grove's board and is still learned from.
+    """
+    if all(s.routes is None for s in config.STOPS):
+        return 0
+    before = len(target)
+    for trip_id, calls in list(target.items()):
+        route = trip_route.get(trip_id, "?")
+        kept = [c for c in calls if config.stop_serves(c[0], route)]
+        if kept:
+            target[trip_id] = kept
+        else:
+            del target[trip_id]
+    return before - len(target)
+
+
 def _read_archive() -> Cache:
     """Scan the zip and return the rows to cache. Touches no database.
 
-    This measures 17.2s against the real 89.4MB archive, which is why it
+    This is the slowest part of a rebuild — seconds against the real archive,
+    and it was 17.2s before the scan became a single pass — which is why it
     happens before a connection is opened at all. Scanning inside the write
     transaction held the lock for that whole pass, and the dashboard — writing
     every polled position to the same file every 15 seconds — failed with
@@ -346,7 +400,6 @@ def _read_archive() -> Cache:
     with zipfile.ZipFile(config.GTFS_ZIP) as zf:
         log.info("scanning stop_times.txt for trips calling at the watched stops")
         seq_rows, target = _scan_stop_times(zf)
-        cache.trip_stops = seq_rows
         log.info(
             "%d trips call at the watched stops, %d stop_times", len(target), len(seq_rows)
         )
@@ -356,6 +409,25 @@ def _read_archive() -> Cache:
             for r in rows(zf, "routes.txt")
         }
 
+        # trips.txt is read here rather than further down because the route is
+        # what decides whether a call survives a per-stop limit, and the scan
+        # cannot know it — `stop_times.txt` carries no route. Only the trips the
+        # scan kept are held: a few thousand rows out of 111,484.
+        trip_rows = [r for r in rows(zf, "trips.txt") if r["trip_id"] in target]
+        trip_route = {r["trip_id"]: routes.get(r["route_id"], "?") for r in trip_rows}
+
+        dropped = _apply_route_limits(target, trip_route)
+        if dropped:
+            seq_rows = [r for r in seq_rows if r[0] in target]
+            trip_rows = [r for r in trip_rows if r["trip_id"] in target]
+            log.info(
+                "%d trips dropped by a per-stop route limit, %d remain with %d stop_times",
+                dropped,
+                len(target),
+                len(seq_rows),
+            )
+
+        cache.trip_stops = seq_rows
         needed_stops: set[str] = {r[2] for r in seq_rows}
         cache.stops = [
             (
@@ -384,10 +456,8 @@ def _read_archive() -> Cache:
                 items[-1][2],
             )
 
-        for r in rows(zf, "trips.txt"):
+        for r in trip_rows:
             tid = r["trip_id"]
-            if tid not in target:
-                continue
             o_stop, o_dep, d_stop, d_arr = endpoints.get(tid, (None, None, None, None))
             cache.trips.append(
                 (

@@ -1,6 +1,6 @@
 # ontime
 
-A live-departures dashboard for three bus stops in Manchester, built on the Department for Transport (DfT) *Bus Open Data Service* (BODS).
+A live-departures dashboard for four bus stops in Manchester, built on the Department for Transport (DfT) *Bus Open Data Service* (BODS).
 
 BODS publishes vehicle positions in the *Standard Interface for Real-time Information* Vehicle Monitoring profile (SIRI-VM). The standard permits an `ExpectedArrivalTime` per stop ahead; Greater Manchester publishers do not populate it. A sample of 417 vehicles contained no `MonitoredCall`, no `OnwardCalls` and no expected arrival of any kind, and the *General Transit Feed Specification – Realtime* (GTFS-RT) mirror carries positions without trip updates.
 
@@ -8,13 +8,17 @@ The feed answers *where is the bus* and never *when will it reach my stop*. Ever
 
 ## The map
 
-Below the departure boards sits a map of the same data: a pin for each watched stop, and a dot for every vehicle the matcher has placed on a trip, rotated to the bearing the feed reports. Route lines run through each route's stop sequence rather than along the road, because every one of the 1,135 watched trips carries an empty `shape_id` and there is no published geometry to draw. Stop spacing has a median of 284m, so the line follows a straight road closely and cuts the corner at a bend.
+Below the departure boards sits a map of the same data: a pin for each watched stop, and a dot for every vehicle the matcher has placed on a trip, rotated to the bearing the feed reports. Route lines run through each route's stop sequence rather than along the road, because every one of the 1,261 watched trips carries an empty `shape_id` and there is no published geometry to draw. Stop spacing has a median of 284m, so the line follows a straight road closely and cuts the corner at a bend.
+
+One line is drawn per route, from the longest variant any of its trips runs, which is exact for seven of the nine routes cached. It is not exact for the 41, whose Oxford Road and Swinton Grove workings share a number and little else, so its line misses ten of the stops its shorter variants call at. The line is context beneath the pins rather than a route diagram, so it is left as it is.
 
 The basemap is the one part of this application that talks to a third party. Tiles load from the server named in `ONTIME_MAP_TILE_URL`, and the page's *Content Security Policy* permits that origin and no other. Leaflet 1.9.4 is vendored under `ontime/static/vendor/` rather than loaded from a content delivery network, which costs 162KB in the image and removes a remote dependency from a dashboard that has to work when something else is down.
 
 ## What the model knows
 
-Learned traversal times are the part of this project that improves with age, and the part hardest to inspect. `/segments` reports the state of them: how many of the 6,771 *segments* the timetable implies have been observed at all, how many carry the five samples `eta.predict` requires, and how wide the uncertainty on each median is. It rebuilds the sample vectors the learner was fitted to rather than reading the summary rows, so the page and the running model cannot drift apart.
+Learned traversal times are the part of this project that improves with age, and the part hardest to inspect. `/segments` reports the state of them: how many of the *segments* the timetable implies have been observed at all, how many carry the five samples `eta.predict` requires, and how wide the uncertainty on each median is. It rebuilds the sample vectors the learner was fitted to rather than reading the summary rows, so the page and the running model cannot drift apart.
+
+That denominator is not a constant, and it moved when the Oxford Road stop was added: a weekday cache implied 6,736 segments at three stops and 9,199 at four. Coverage as a percentage therefore fell by about a third overnight without a single observation being lost. A drop across that boundary reads as a bigger timetable, not as a regression.
 
 Intervals are *distribution-free*, taken from order statistics instead of an assumed shape, because traversal times are bounded below by the road and not bounded above by traffic. The widest interval n samples can offer covers the true median with probability 1 − 2/2ⁿ, which first clears 95% at n = 6 — one more than the gate requires. The page also counts the hops it could not measure because a stop between two detections went unseen, a gap in watching rather than in the timetable.
 

@@ -22,16 +22,19 @@ import requests
 from starlette.testclient import TestClient
 
 from ontime import config, db, eta, history, ingest, web
-from ontime.matching import LONDON
+from ontime.matching import LONDON, load_trips
 
 from .conftest import (
     MINI_GTFS,
     STOP_50,
     STOP_192,
+    STOP_192_DOWNSTREAM,
     STOP_ABSENT,
+    STOP_ABSENT_2,
     WIDE_LOOKBACK_HOURS,
     any_trip_serving,
     load_trip,
+    service_midnight,
     siri_document,
     vehicle_on_trip,
 )
@@ -199,6 +202,188 @@ class TestPipeline:
                 etas = [d["eta_ts"] for d in stop["departures"]]
                 assert etas == sorted(etas)
 
+    def test_stop_absent_from_the_archive_still_appears_on_the_board(self, live_app):
+        """Every watched stop gets a panel, served by the fixture or not.
+
+        Two of the four are absent from the cut-down archive, and a stop that
+        renders nothing at all is indistinguishable from one that has been
+        dropped from the configuration.
+        """
+        with TestClient(web.app) as client:
+            atcos = [s["atco"] for s in client.get("/api/board").json()["stops"]]
+        assert atcos == [s.atco for s in config.STOPS]
+        assert STOP_ABSENT_2 in atcos
+
+
+class TestTripServingTwoWatchedStops:
+    """One trip, two watched stops — real since MANGTMGT joined the list.
+
+    Every 191 calls at Hyde Grove and then, further along, at University
+    Shopping Centre; before the fourth stop was added, no cached trip called
+    at a watched stop more than once. The 191 is not in the cut-down archive,
+    so the configuration is reproduced over the 192 instead: `STOP_192` and a
+    stop five further along the same real sequence, which all fifteen fixture
+    192 trips run.
+
+    The stops have to be watched before the cache is built, because the scan
+    keeps `target_calls` for exactly the stops configured at that moment —
+    hence the rebuild here rather than the `live_app` fixture.
+    """
+
+    @pytest.fixture
+    def two_stop_app(self, data_dir, feed, api_key, monkeypatch):
+        pair = tuple(
+            config.Stop(atco, f"NAP{i}", f"Stop {i}", "fixture")
+            for i, atco in enumerate((STOP_192, STOP_192_DOWNSTREAM))
+        )
+        monkeypatch.setattr(config, "STOPS", pair)
+        monkeypatch.setattr(config, "STOP_IDS", frozenset(s.atco for s in pair))
+        monkeypatch.setattr(config, "STOP_BY_ID", {s.atco: s for s in pair})
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+        monkeypatch.setattr(web, "state", web.State())
+        monkeypatch.setattr(web, "_segments_cache", None)
+        return feed
+
+    def test_the_cache_keeps_both_calls(self, two_stop_app):
+        conn = db.connect()
+        rows = list(
+            conn.execute(
+                "SELECT trip_id, stop_id, seq FROM target_calls ORDER BY trip_id, seq"
+            )
+        )
+        conn.close()
+        per_trip = {}
+        for r in rows:
+            per_trip.setdefault(r["trip_id"], []).append((r["stop_id"], r["seq"]))
+        both = {t: v for t, v in per_trip.items() if len(v) == 2}
+        assert len(both) == 15, "every fixture 192 trip calls at both"
+        for calls in both.values():
+            assert [c[0] for c in calls] == [STOP_192, STOP_192_DOWNSTREAM]
+
+    def test_one_vehicle_is_predicted_at_both_stops(self, two_stop_app):
+        """And reaches the upstream one first.
+
+        `eta.predict` is asked once per watched stop, so a trip serving two of
+        them yields two rows from a single vehicle. The ordering is the part
+        worth pinning: both estimates walk the same stop sequence from the same
+        matched position, so the downstream stop cannot come first.
+        """
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trip = load_trip(conn, any_trip_serving(conn, STOP_192), today)
+        conn.close()
+        upstream = next(i for i, s in enumerate(trip.stops) if s[1] == STOP_192)
+        two_stop_app["payload"] = siri_document([vehicle_on_trip(trip, upstream - 3)])
+
+        with TestClient(web.app) as client:
+            stops = {s["atco"]: s for s in client.get("/api/board").json()["stops"]}
+
+        near = [d for d in stops[STOP_192]["departures"] if d["vehicle"] == "TEST01"]
+        far = [
+            d for d in stops[STOP_192_DOWNSTREAM]["departures"] if d["vehicle"] == "TEST01"
+        ]
+        assert len(near) == 1 and len(far) == 1
+        assert near[0]["eta_ts"] < far[0]["eta_ts"]
+        assert near[0]["stops_away"] == 3
+        assert far[0]["stops_away"] == 8
+
+    def test_a_trip_with_no_vehicle_is_scheduled_at_both_stops(self, two_stop_app):
+        """`scheduled_only` walks `target_calls`, which now holds two per trip.
+
+        A list comprehension that stopped at the first watched call would leave
+        the downstream stop's board empty whenever nothing was running.
+
+        Asked over a whole service day rather than through the board, whose
+        one-hour horizon would make this pass or fail on the time of day.
+        """
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trips = load_trips(conn, (today,))
+        conn.close()
+
+        # A horizon wide enough for a service day, which runs past 24 hours.
+        preds = eta.scheduled_only(trips, set(), service_midnight(today), 30 * 3600)
+
+        assert {p.source for p in preds} == {"scheduled"}
+        assert {p.stop_id for p in preds} == {STOP_192, STOP_192_DOWNSTREAM}
+        # The fifteen 192 trips reach both stops, so each yields two rows; the
+        # fifteen 50s in the fixture call at neither and yield none.
+        assert len(preds) == 30
+
+
+class TestRestrictedStopOnTheBoard:
+    """A barred route must not reach a restricted stop's board by the back door.
+
+    Dropping it at ingest is not enough on its own. A trip cached for some other
+    watched stop still runs *through* the restricted one — the 191 passes
+    University Shopping Centre on its way to Hyde Grove — so it is matched, it
+    is in `state.trips`, and both `eta.predict` and `scheduled_only` will happily
+    place it at a stop that does not want it. Thirteen real 191 trips do exactly
+    this every weekday.
+
+    Reproduced over the 192: `STOP_192` is restricted to the 50, which does not
+    run there, while `STOP_192_DOWNSTREAM` stays open and keeps the trips cached.
+    """
+
+    @pytest.fixture
+    def restricted_app(self, data_dir, feed, api_key, monkeypatch):
+        stops = (
+            config.Stop(STOP_192, "N1", "Restricted", "d", routes=frozenset({"50"})),
+            config.Stop(STOP_192_DOWNSTREAM, "N2", "Open", "d"),
+        )
+        monkeypatch.setattr(config, "STOPS", stops)
+        monkeypatch.setattr(config, "STOP_IDS", frozenset(s.atco for s in stops))
+        monkeypatch.setattr(config, "STOP_BY_ID", {s.atco: s for s in stops})
+        shutil.copy(MINI_GTFS, config.GTFS_ZIP)
+        ingest.build()
+        monkeypatch.setattr(web, "state", web.State())
+        monkeypatch.setattr(web, "_segments_cache", None)
+        return feed
+
+    def test_the_trips_really_do_pass_through(self, restricted_app):
+        """Without this the rest of the class could pass for the wrong reason."""
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trips = load_trips(conn, (today,))
+        conn.close()
+        assert len(trips) == 15
+        assert all(STOP_192 in t.index_of for t in trips), "the barred stop is on the path"
+        assert all(t.route_name == "192" for t in trips)
+
+    def test_a_live_vehicle_is_withheld_from_the_restricted_stop(self, restricted_app):
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trip = load_trip(conn, any_trip_serving(conn, STOP_192_DOWNSTREAM), today)
+        conn.close()
+        upstream = next(i for i, s in enumerate(trip.stops) if s[1] == STOP_192)
+        restricted_app["payload"] = siri_document([vehicle_on_trip(trip, upstream - 3)])
+
+        with TestClient(web.app) as client:
+            body = client.get("/api/board").json()
+        stops = {s["atco"]: s for s in body["stops"]}
+
+        assert body["counts"]["matched"] == 1, "the vehicle is matched, just not shown"
+        assert stops[STOP_192]["departures"] == []
+        # Named rather than counted: whether a *scheduled* 192 also falls inside
+        # the hour horizon depends on the time of day the suite runs.
+        live = [
+            d for d in stops[STOP_192_DOWNSTREAM]["departures"] if d["vehicle"] == "TEST01"
+        ]
+        assert len(live) == 1
+        assert live[0]["route"] == "192"
+
+    def test_the_timetable_fallback_is_withheld_too(self, restricted_app):
+        """`scheduled_only` reads `Trip.target_calls`, so the filter lives there."""
+        conn = db.connect()
+        today = datetime.now(LONDON).date()
+        trips = load_trips(conn, (today,))
+        conn.close()
+
+        preds = eta.scheduled_only(trips, set(), service_midnight(today), 30 * 3600)
+        assert {p.stop_id for p in preds} == {STOP_192_DOWNSTREAM}
+        assert len(preds) == 15
+
 
 class TestLearningImprovesPredictions:
     SLOW_PACE_SECS = 300
@@ -323,7 +508,12 @@ class TestHttpApi:
     def test_stops_endpoint(self, live_app):
         with TestClient(web.app) as client:
             body = client.get("/api/stops").json()
-        assert {s["naptan"] for s in body} == {"MANADGMT", "MANGPWTD", "MANADTDW"}
+        assert {s["naptan"] for s in body} == {
+            "MANADGMT",
+            "MANGPWTD",
+            "MANADTDW",
+            "MANGTMGT",
+        }
 
     def test_healthz_reports_ready_after_a_poll(self, live_app):
         with TestClient(web.app) as client:
