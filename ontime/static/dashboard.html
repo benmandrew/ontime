@@ -294,17 +294,24 @@ function updateMap(data) {
   }
 }
 
-async function tick() {
-  try {
-    const r = await fetch('/api/board');
-    render(await r.json());
-  } catch (e) {
+// The board is pushed, not polled: the server holds this connection open and
+// writes a message when a poll produces a new board. Every open page therefore
+// updates at the moment the data changes, instead of on its own clock — which
+// used to mean a board could be up to a poll old before anyone here asked.
+function connect() {
+  const es = new EventSource('/api/stream');
+  es.onmessage = ev => render(JSON.parse(ev.data));
+  es.onerror = () => {
+    // A dropped connection leaves the stream CONNECTING and the browser retries
+    // on its own. CLOSED means it has given up — the server answered something
+    // that is not a stream — and only then is retrying ours to do. Either way
+    // the next message repaints `meta`, so this text clears itself.
     document.getElementById('meta').textContent = 'server unreachable';
-  }
+    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 5000);
+  };
 }
 initMap();
-tick();
-setInterval(tick, 10000);
+connect();
 </script>
 </body>
 </html>

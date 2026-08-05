@@ -81,6 +81,11 @@
       measurement says so — detections sit a median 29m from the stop against
       1,019m for the misses, and runs watched continuously miss nothing at all.
 
+- [x] The board arrives over SSE (`/api/stream`) rather than a 10s poll from
+      each page. One poll now produces one message to every open page at the
+      moment the data changes, instead of every viewer asking on its own clock
+      and mostly being told what it already had. `/api/board` stays for `curl`.
+
 ## Next
 
 - [ ] Measure the skipped share on the deployment, where the poller runs

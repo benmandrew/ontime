@@ -301,6 +301,24 @@ memory, and it cut all three configurations by about a fifth.
     figure of 82MB was an artefact of a script that ran the scan twice and held
     both results.
 
+30. **The board is pushed, not polled** — `/api/stream`, SSE, one message per
+    poll to every open page. Subscribers are *woken*, never fed: each holds an
+    `asyncio.Event` and reads `state.board` when it fires. Handing each one its
+    own copy would mean a queue per viewer, which behind a slow client either
+    grows without bound or has to choose which board to drop; waking coalesces
+    for free, and the newest board is the only one a display wants. Clear the
+    event *before* reading the board — the other order drops any poll landing
+    between the read and the clear. `publish()` sits after the `try/except` in
+    `poll_and_store`, not inside the success path: a board that has stopped
+    updating must say so rather than sit there looking current. The keepalive
+    comment line matters twice — a proxy closes an idle connection, and a
+    connection dead at the other end is otherwise never noticed. `/api/board`
+    stays for `curl` and for tests to compare against.
+    Beware: **starlette's TestClient collects a response body to completion**
+    before it returns, so `client.stream("GET", "/api/stream")` does not hang
+    the request, it hangs the *suite* — the body never completes by design.
+    `TestBoardStream` drives `web._board_events()` under `asyncio.run` instead.
+
 ## Measured baselines (Apple silicon unless noted, real data)
 
 Rebuild **2.16s** against the real 89.4MB archive (was 17.29s two-pass), the write
@@ -310,12 +328,13 @@ in 1MB chunks. 4MB chunks measured no faster and 27MB worse. (Both RSS figures a
 superseded by the pooling in 29, which was not applied when these were taken.) Cache 7.6MB · duty cycle
 <3% at a 15s poll · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured).
 Docker image 62.7MB (was 62.4MB before Leaflet's 162KB), non-root, no
-pip/fastapi/pydantic. `nix develop` ~10s. **310 tests** collected, 309 passing
-and 1 skipped — counted with `pytest`, not remembered; the recorded 216 and 312
-were both stale. The 19 in `tests/test_geometry.py` are the newest.
+pip/fastapi/pydantic. `nix develop` ~10s. **317 tests** collected, all passing
+with node installed and a key in `.env` — counted with `pytest`, not remembered;
+the recorded 216, 310 and 312 were all stale. The newest are the 7 in
+`TestBoardStream` (30); the 19 in `tests/test_geometry.py` came just before.
 `/api/map` carries 1,904 points in 44KB for a Thursday, against ~450 before the
 road geometry landed; the file behind it is 56KB and 2,540 points, fetched once
-on load rather than on the 10s poll.
+on load rather than riding the board stream (30).
 
 Adding MANGTMGT, measured on x86-64 Linux against the 2026-07-30 archive — three
 stops / four unrestricted / four with the 41 limit, same machine, same file, all

@@ -11,7 +11,9 @@ import asyncio
 import base64
 import contextlib
 import hashlib
+import json
 import re
+from collections.abc import AsyncGenerator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -20,7 +22,7 @@ from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse
+from starlette.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.routing import Route
 
 from . import config, db, eta, geometry, history, locking, logs, segments, siri
@@ -34,6 +36,8 @@ log = logs.get("ontime.web")
 # design, so anyone who can reach it would read all of that. The full text goes
 # to the log, which is redacted and stays inside the container.
 POLL_ERROR = "Live data is temporarily unavailable."
+
+NOSNIFF = {"X-Content-Type-Options": "nosniff"}
 
 
 class State:
@@ -332,6 +336,9 @@ async def poll_and_store() -> None:
         # container; the board gets a fixed string. See POLL_ERROR.
         log.exception("poll failed: %s", config.redact(str(exc)))
         state.board = {**state.board, "error": POLL_ERROR}
+    # Failures are published too: a board that has stopped updating should say
+    # so on the page rather than sit there looking current.
+    publish()
 
 
 async def poller() -> None:
@@ -369,7 +376,83 @@ def _json(body, status_code: int = 200) -> JSONResponse:
 
 
 async def api_board(_request: Request) -> JSONResponse:
+    """The current board as one response.
+
+    The page reads `/api/stream` instead; this stays for `curl`, for anything
+    that wants a board without holding a connection open, and because the
+    stream's own tests need something to compare against.
+    """
     return _json(state.board)
+
+
+# ---- Live stream -------------------------------------------------------------
+# Subscribers are woken, never fed. Each open page holds an Event, and a poll
+# sets all of them; the handler then reads whatever `state.board` says now.
+# Handing each subscriber its own copy of the board would mean queues, and a
+# queue behind a slow client either grows without bound or has to decide which
+# board to drop. Waking coalesces for free: a client that misses two polls while
+# writing sends the newest board once, which is the only one a display wants.
+_subscribers: set[asyncio.Event] = set()
+
+# Long enough to stay quiet, short enough that a proxy idle timeout does not
+# reach it. The board itself arrives every POLL_SECS, so this only fires when
+# polling has stalled — which is exactly when a dead connection would otherwise
+# go unnoticed by both ends.
+KEEPALIVE_SECS = 20.0
+
+SSE_HEADERS = {
+    # No proxy or browser may hold on to a stream that is only meaningful live.
+    "Cache-Control": "no-store",
+    # nginx and friends buffer a response body by default, which for a stream
+    # means the page shows nothing until the buffer fills.
+    "X-Accel-Buffering": "no",
+    **NOSNIFF,
+}
+
+
+def publish() -> None:
+    """Wake every open stream. Synchronous, so the set cannot change under it."""
+    for ev in _subscribers:
+        ev.set()
+
+
+def _event(board: dict) -> bytes:
+    """One SSE message. The blank line is the terminator, not decoration."""
+    return b"data: " + json.dumps(board).encode() + b"\n\n"
+
+
+async def _board_events() -> AsyncGenerator[bytes, None]:
+    ev = asyncio.Event()
+    _subscribers.add(ev)
+    try:
+        # The current board first, rather than making a page that has just
+        # loaded wait up to a full poll for its first paint.
+        yield _event(state.board)
+        while True:
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=KEEPALIVE_SECS)
+            except TimeoutError:
+                yield b": keepalive\n\n"  # a comment line; the client ignores it
+                continue
+            # Cleared before the board is read, not after. The other order drops
+            # any poll that lands between the read and the clear.
+            ev.clear()
+            yield _event(state.board)
+    finally:
+        # Reached when the client goes away and the server closes the generator.
+        _subscribers.discard(ev)
+
+
+async def api_stream(_request: Request) -> StreamingResponse:
+    """The board, pushed as it changes.
+
+    One poll, one message, to every open page at once — instead of every page
+    asking on its own clock and mostly being told what it already knew. The
+    browser reconnects on its own if this drops, so nothing here retries.
+    """
+    return StreamingResponse(
+        _board_events(), media_type="text/event-stream", headers=SSE_HEADERS
+    )
 
 
 async def api_map(_request: Request) -> JSONResponse:
@@ -498,7 +581,9 @@ def content_security_policy(html: str) -> str:
             "script-src 'self' " + " ".join(_inline_hashes(html, "script")),
             "style-src 'self' " + " ".join(_inline_hashes(html, "style")),
             "img-src 'self' data: " + tile_origin(config.MAP_TILE_URL),
-            "connect-src 'self'",  # the page's own /api/board and /api/map polls
+            # The page's own /api/map fetch and its EventSource on /api/stream,
+            # which this directive governs as well.
+            "connect-src 'self'",
             "base-uri 'none'",
             "form-action 'none'",
             "frame-ancestors 'none'",
@@ -515,8 +600,6 @@ CSP = content_security_policy(DASHBOARD.read_text())
 # and the looser of them would be the one nobody was watching.
 SEGMENTS_PAGE = STATIC / "segments.html"
 SEGMENTS_CSP = content_security_policy(SEGMENTS_PAGE.read_text())
-
-NOSNIFF = {"X-Content-Type-Options": "nosniff"}
 
 # Leaflet 1.9.4, vendored rather than pulled from a CDN. The page names no
 # external script or style source, and a dashboard that stops drawing because
@@ -574,6 +657,7 @@ app = Starlette(
         Route("/segments", segments_page),
         Route("/vendor/{name}", vendor),
         Route("/api/board", api_board),
+        Route("/api/stream", api_stream),
         Route("/api/map", api_map),
         Route("/api/stops", api_stops),
         Route("/api/segments", api_segments),

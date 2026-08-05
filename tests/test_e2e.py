@@ -7,6 +7,7 @@ here reaches BODS, so the suite runs offline and in the Nix sandbox.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import hashlib
@@ -83,10 +84,13 @@ const nodes = {};
 globalThis.document = {
   getElementById: id => (nodes[id] = nodes[id] || { innerHTML: '', textContent: '' }),
 };
-// The page starts polling as it loads. Leaving that promise pending keeps the
-// render under test the only thing that writes to the stub document.
+// The page opens its stream and fetches the map config as it loads. Stubbing
+// both to do nothing keeps the render under test the only thing that writes to
+// the stub document.
 globalThis.fetch = () => new Promise(() => {});
 globalThis.setInterval = () => 0;
+globalThis.setTimeout = () => 0;
+globalThis.EventSource = function () { return { readyState: 0 }; };
 globalThis.__board = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
 (0, eval)(script + '\nrender(__board);');
 const read = id => nodes[id] || { innerHTML: '', textContent: '' };
@@ -503,7 +507,7 @@ class TestHttpApi:
             r = client.get("/")
         assert r.status_code == 200
         assert "ontime" in r.text
-        assert "/api/board" in r.text
+        assert "/api/stream" in r.text
 
     def test_stops_endpoint(self, live_app):
         with TestClient(web.app) as client:
@@ -813,6 +817,108 @@ class TestHttpApi:
             row = live_departure(client, STOP_192)
 
         assert row["delay_mins"] == 0
+
+
+class TestBoardStream:
+    """The board is pushed to open pages rather than asked for on a timer.
+
+    Driven through the generator the endpoint returns, not through TestClient:
+    that collects a response body to completion before handing it over, and this
+    body never completes by design.
+    """
+
+    @pytest.fixture
+    def board(self, monkeypatch):
+        """A board with no database behind it — these test delivery, not content."""
+        monkeypatch.setattr(web, "state", web.State())
+        web.state.board = {"stops": [], "updated": 1.0, "error": None}
+        return web.state
+
+    def test_the_response_declares_an_unbuffered_event_stream(self):
+        r = asyncio.run(web.api_stream(None))
+        headers = {k.decode(): v.decode() for k, v in r.raw_headers}
+        assert r.media_type == "text/event-stream"
+        assert headers["cache-control"] == "no-store"
+        assert headers["x-accel-buffering"] == "no"
+        assert headers["x-content-type-options"] == "nosniff"
+
+    def test_a_new_page_is_sent_the_board_at_once(self, board):
+        """Otherwise a page that has just loaded shows nothing until the next poll."""
+
+        async def first() -> bytes:
+            gen = web._board_events()
+            try:
+                return await anext(gen)
+            finally:
+                await gen.aclose()
+
+        chunk = asyncio.run(first())
+        assert chunk.startswith(b"data: ") and chunk.endswith(b"\n\n")
+        assert json.loads(chunk[6:]) == board.board
+
+    def test_a_poll_pushes_the_new_board_to_an_open_stream(self, board):
+        async def drive() -> bytes:
+            gen = web._board_events()
+            try:
+                await anext(gen)  # the board as it stood on connect
+                board.board = {**board.board, "updated": 2.0}
+                web.publish()
+                return await anext(gen)
+            finally:
+                await gen.aclose()
+
+        assert json.loads(asyncio.run(drive())[6:])["updated"] == 2.0
+
+    def test_every_poll_publishes(self, live_app):
+        """The one link between polling and the page. Nothing else would notice
+        if `poll_and_store` stopped calling `publish`."""
+        woken = asyncio.Event()
+        web._subscribers.add(woken)
+        try:
+            asyncio.run(web.poll_and_store())
+            assert woken.is_set()
+        finally:
+            web._subscribers.discard(woken)
+
+    def test_a_failed_poll_is_published_too(self, board, monkeypatch):
+        """A board that has stopped updating must say so, not sit there looking
+        current — which is the whole reason `publish` is not on the happy path."""
+        monkeypatch.setattr(web, "poll_once", lambda: 1 / 0)
+        woken = asyncio.Event()
+        web._subscribers.add(woken)
+        try:
+            asyncio.run(web.poll_and_store())
+            assert woken.is_set()
+            assert board.board["error"] == web.POLL_ERROR
+        finally:
+            web._subscribers.discard(woken)
+
+    def test_a_quiet_stream_still_writes_something(self, board, monkeypatch):
+        """A proxy that sees nothing for long enough closes the connection."""
+        monkeypatch.setattr(web, "KEEPALIVE_SECS", 0.01)
+
+        async def drive() -> bytes:
+            gen = web._board_events()
+            try:
+                await anext(gen)
+                return await anext(gen)
+            finally:
+                await gen.aclose()
+
+        assert asyncio.run(drive()) == b": keepalive\n\n"
+
+    def test_a_closed_stream_leaves_nothing_behind(self, board):
+        """The subscriber set is the one thing here that grows per viewer."""
+
+        async def open_then_close() -> int:
+            gen = web._board_events()
+            await anext(gen)
+            held = len(web._subscribers)
+            await gen.aclose()
+            return held
+
+        assert asyncio.run(open_then_close()) == 1
+        assert web._subscribers == set()
 
 
 class TestColdStart:
