@@ -407,18 +407,27 @@ class TestLearningImprovesPredictions:
         timetable while the assert below still passes on the weekday bucket
         this seeded. That made the test pass Monday to Friday and fail every
         weekend, on a schedule no code change here would explain.
+
+        The days are counted in London rather than UTC for the hour half of
+        the same problem. Subtracting whole UTC days holds the UTC hour still,
+        so every day on the far side of a clock change lands an hour off in
+        local time and in a different bucket — and filtering those out would
+        never terminate, since after a transition there are not ten aligned
+        days behind us to find. Subtracting local days keeps the wall clock
+        fixed instead and lets the UTC instant move, which is what the bucket
+        is keyed on anyway.
         """
         from .test_history import FakeVehicle
 
-        now = datetime.now(UTC)
-        weekend_now = now.astimezone(LONDON).weekday() >= 5
+        local_now = datetime.now(LONDON)
+        weekend_now = local_now.weekday() >= 5
         anchors: list[datetime] = []
         day = 0
         while len(anchors) < runs:
             day += 1
-            candidate = now - timedelta(days=day)
-            if (candidate.astimezone(LONDON).weekday() >= 5) == weekend_now:
-                anchors.append(candidate)
+            candidate = local_now - timedelta(days=day)
+            if (candidate.weekday() >= 5) == weekend_now:
+                anchors.append(candidate.astimezone(UTC))
         for run, anchor in enumerate(anchors, start=1):
             for i, (_s, _sid, _a, lat, lon) in enumerate(trip.stops):
                 when = anchor + timedelta(seconds=(i - pivot_index) * self.SLOW_PACE_SECS)
