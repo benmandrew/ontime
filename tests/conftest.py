@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import tempfile
+import zipfile
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,10 +21,49 @@ import pytest
 
 from ontime import config, db, ingest
 from ontime.matching import LONDON, Trip
+from ontime.matching import service_midnight as matching_service_midnight
 
 FIXTURES = Path(__file__).parent / "fixtures"
-MINI_GTFS = FIXTURES / "mini_gtfs.zip"
+COMMITTED_GTFS = FIXTURES / "mini_gtfs.zip"
 SIRI_SAMPLE = FIXTURES / "siri_sample.xml"
+
+
+def _unexpiring_gtfs() -> Path:
+    """The fixture archive, with its calendar extended to cover today.
+
+    The committed archive's three services end 2035-12-31, and
+    `matching._runs_on` answers False outside a service's range -- so from 2036
+    `load_trips` returns nothing and some twenty tests fail as a wrong trip
+    count rather than as an expired fixture. Rewriting the end date removes the
+    deadline rather than moving it, which editing the committed file would only
+    do.
+
+    Done here, against the constant every test copies from, because there are
+    two dozen `shutil.copy(MINI_GTFS, ...)` call sites across five modules and
+    a fix that had to be repeated at each of them would be reintroduced by the
+    next one written. The start date is deliberately left alone: several tests
+    pin real past dates -- the clock-change Sundays -- which have to stay
+    inside the range.
+    """
+    workspace = tempfile.mkdtemp(prefix="ontime-gtfs-")
+    _SESSION_DIRS.append(workspace)
+    dest = Path(workspace) / "mini_gtfs.zip"
+    horizon = (datetime.now(LONDON).date() + timedelta(days=5 * 365)).strftime("%Y%m%d")
+    with zipfile.ZipFile(COMMITTED_GTFS) as src, zipfile.ZipFile(dest, "w") as out:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "calendar.txt":
+                head, *rows = data.decode().splitlines()
+                rewritten = [",".join([*r.split(",")[:-1], horizon]) for r in rows if r]
+                data = ("\n".join([head, *rewritten]) + "\n").encode()
+            out.writestr(item.filename, data)
+    return dest
+
+
+# Kept alive for the session, and cleaned up by the OS rather than atexit: the
+# archive has to outlive every test that copies it, and it is a few hundred KB.
+_SESSION_DIRS: list[str] = []
+MINI_GTFS = _unexpiring_gtfs()
 
 # Present in the fixture archive.
 STOP_192 = "1800EB06241"  # MANADTDW, Cavanagh Close
@@ -105,7 +146,20 @@ def any_trip_serving(conn: sqlite3.Connection, stop_id: str) -> str:
 
 
 def service_midnight(day) -> float:
-    return datetime(day.year, day.month, day.day, tzinfo=LONDON).timestamp()
+    """Re-exported from the code under test, deliberately not reimplemented.
+
+    This used to return local midnight. GTFS anchors a service day at noon
+    minus twelve hours instead, and the difference is exactly the hour that
+    `matching.service_midnight`'s own docstring exists to explain: on the two
+    clock-change Sundays the local day is 23 or 25 hours long. So on those two
+    days a year `vehicle_on_trip` stamped every synthesised vehicle with a
+    departure an hour away from what `match` computes, putting `dep_delta`
+    past TIER3_TOL and silently matching some vehicles to the wrong run --
+    which is the failure `TestClockChanges` was written to catch, reintroduced
+    through the harness that tests for it. test_matching.py already imports
+    the real one; the two callers disagreeing was the whole bug.
+    """
+    return matching_service_midnight(day)
 
 
 def vehicle_xml(

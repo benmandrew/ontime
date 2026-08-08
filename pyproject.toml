@@ -56,7 +56,12 @@ exclude = ["^tests/", "^scripts/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q --strict-markers"
+# `-m "not live"` is what actually makes the live tests opt-in. Without it the
+# marker only labelled them: TestAgainstTheRealFeed ran on every local and CI
+# run despite its docstring saying otherwise, so a third-party outage failed
+# the job that gates image publishing. A `-m` on the command line replaces this
+# one, so the documented `pytest -m live` still selects them.
+addopts = '-q --strict-markers -m "not live"'
 markers = [
     "e2e: end-to-end tests covering ingest, matching, prediction and the HTTP API",
     "live: tests that hit the real BODS feed (require BODS_API_KEY; deselected by default)",
