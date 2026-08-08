@@ -399,12 +399,27 @@ class TestLearningImprovesPredictions:
         upstream stop, and prediction reads the bucket for the current hour.
         Each past run is therefore anchored so that its departure from
         `pivot_index` falls on this hour, on an earlier day.
+
+        The bucket is also split weekday/weekend, so the earlier days have to
+        match today's side of that split. Walking back `runs` *consecutive*
+        days does not: on a Saturday only two of the last ten are weekend days,
+        which is under MIN_SAMPLES, and the prediction falls back to the
+        timetable while the assert below still passes on the weekday bucket
+        this seeded. That made the test pass Monday to Friday and fail every
+        weekend, on a schedule no code change here would explain.
         """
         from .test_history import FakeVehicle
 
         now = datetime.now(UTC)
-        for run in range(1, runs + 1):
-            anchor = now - timedelta(days=run)
+        weekend_now = now.astimezone(LONDON).weekday() >= 5
+        anchors: list[datetime] = []
+        day = 0
+        while len(anchors) < runs:
+            day += 1
+            candidate = now - timedelta(days=day)
+            if (candidate.astimezone(LONDON).weekday() >= 5) == weekend_now:
+                anchors.append(candidate)
+        for run, anchor in enumerate(anchors, start=1):
             for i, (_s, _sid, _a, lat, lon) in enumerate(trip.stops):
                 when = anchor + timedelta(seconds=(i - pivot_index) * self.SLOW_PACE_SECS)
                 history.record(conn, FakeVehicle(f"H{run}", when, lat, lon), trip.trip_id)
