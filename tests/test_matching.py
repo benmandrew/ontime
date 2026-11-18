@@ -221,6 +221,59 @@ class TestClockChanges:
         assert got.dep_delta == 0
 
 
+class TestSharedPatterns:
+    def test_pattern_ignores_arrival_times(self, built_db):
+        today = datetime.now(LONDON).date()
+        base = load_trip(built_db, any_trip_serving(built_db, STOP_192), today)
+        later = replace(
+            base,
+            trip_id="later",
+            stops=[
+                (q, sid, (arr or 0) + 600, la, lo) for q, sid, arr, la, lo in base.stops
+            ],
+        )
+        assert later.stops != base.stops
+        assert later.pattern == base.pattern
+        rerouted = replace(base, trip_id="rerouted", stops=base.stops[1:])
+        assert rerouted.pattern != base.pattern
+
+    def test_trips_sharing_a_pattern_still_match_on_departure(self, built_db):
+        """The distance memo is shared across a pattern; the departure memo is not.
+
+        Every candidate here walks the same stops with different arrival times,
+        as runs of one route through the day do. Sharing the distance must not
+        leak into the tie-break, which has to pick the run due away at 08:00.
+        """
+        day = datetime.now(LONDON).date()
+        base = load_trip(built_db, any_trip_serving(built_db, STOP_192), day)
+        runs = [
+            replace(
+                base,
+                trip_id=f"run-{h:02d}",
+                first_dep=h * 3600,
+                stops=[
+                    (q, sid, (arr or 0) + h * 3600, la, lo)
+                    for q, sid, arr, la, lo in base.stops
+                ],
+            )
+            for h in range(6, 11)
+        ]
+        away = datetime.fromtimestamp(service_midnight(day) + 8 * 3600, UTC)
+        xml = vehicle_xml(
+            line=base.route_name,
+            origin_ref=base.origin_stop_id,
+            dest_ref=base.dest_stop_id,
+            origin_dep=away,
+            recorded_at=away,
+            lat=base.stops[4][3],
+            lon=base.stops[4][4],
+        )
+        got = match(siri.parse(siri_document([xml]))[0], runs)
+        assert got is not None
+        assert got.trip.trip_id == "run-08"
+        assert got.pos_idx == 4
+
+
 class TestLoadTrips:
     def test_loads_fixture_trips(self, built_db):
         today = datetime.now(LONDON).date()

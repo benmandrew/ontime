@@ -328,10 +328,11 @@ in 1MB chunks. 4MB chunks measured no faster and 27MB worse. (Both RSS figures a
 superseded by the pooling in 29, which was not applied when these were taken.) Cache 7.6MB · duty cycle
 <3% at a 15s poll · history 6,018 rows/day = 0.6MB/day, 12MB at 21 days (measured).
 Docker image 62.7MB (was 62.4MB before Leaflet's 162KB), non-root, no
-pip/fastapi/pydantic. `nix develop` ~10s. **317 tests** collected, all passing
+pip/fastapi/pydantic. `nix develop` ~10s. **325 tests** collected, all passing
 with node installed and a key in `.env` — counted with `pytest`, not remembered;
-the recorded 216, 310 and 312 were all stale. The newest are the 7 in
-`TestBoardStream` (30); the 19 in `tests/test_geometry.py` came just before.
+the recorded 216, 310, 312 and 317 were all stale. The newest are the 8 poll-cost
+tests in `test_matching`, `test_siri`, `test_history` and `test_e2e`; the 7 in
+`TestBoardStream` (30) came just before.
 `/api/map` carries 1,904 points in 44KB for a Thursday, against ~450 before the
 road geometry landed; the file behind it is 56KB and 2,540 points, fetched once
 on load rather than riding the board stream (30).
@@ -347,6 +348,19 @@ either way. The Apple-silicon figures above are not comparable and were left alo
 Peak RSS before the pooling was 52.6 / 74.1 / 68.3MB, so the fourth stop now costs
 about 7MB of peak against the three-stop configuration rather than 16MB, and the
 whole four-stop rebuild sits below where three stops used to.
+
+Poll cost on fisk (arm64, 776MB database, 68 of 709 feed vehicles kept, 992 trips),
+CPU per poll with the download excluded: **1.1–1.7s before, 0.11s after**. The
+duty-cycle figure above predates the history tables growing. Of the 1.1s,
+`history.stats_summary` was 0.84s: two `COUNT(*)` scans over 4.3M observations and
+1.85M stop events, now taken every five minutes (`web.HISTORY_SUMMARY_SECS`).
+`siri.parse` reads the route first and skips unwatched vehicles, 0.13s to 0.055s.
+`match` memoises distance and direction per stop pattern (`Trip.pattern`, an
+interned int) instead of per trip: 14 patterns against 496 stop lists, 8,173 walks
+for 68 vehicles before, 0.115s to 0.063s. `refresh_segments` reloads the 10,665
+rows only when `learn_segments` moves the `segments_learned_at` stamp in `meta`,
+0.155s to 0.107s a poll; an unstamped database still reloads every poll. What
+remains is mostly the parse, which still reads 709 route names.
 
 Matching 20 fixture vehicles: 3.35ms before memoisation, **2.00ms** after. Sharing one
 haversine per stop id already made the trigonometry cheap — 191 calls — but `_nearest`

@@ -169,6 +169,34 @@ def test_route_filter(monkeypatch, api_key):
     assert {v.route_name for v in kept} == {"192", "50"}
 
 
+def test_parse_drops_other_routes_before_reading_them():
+    """`parse` applies the route filter itself, and without one keeps everything."""
+    now = datetime.now(UTC)
+    kept = vehicle_xml(
+        line="192",
+        origin_ref="A",
+        dest_ref="B",
+        origin_dep=now,
+        recorded_at=now,
+        lat=53.46,
+        lon=-2.22,
+        vehicle_ref="KEEP",
+    )
+    other = vehicle_xml(
+        line="999",
+        origin_ref="A",
+        dest_ref="B",
+        origin_dep=now,
+        recorded_at=now,
+        lat=53.46,
+        lon=-2.22,
+        vehicle_ref="SKIP",
+    )
+    doc = siri_document([kept, other])
+    assert [v.vehicle_ref for v in siri.parse(doc, {"192"})] == ["KEEP"]
+    assert {v.vehicle_ref for v in siri.parse(doc)} == {"KEEP", "SKIP"}
+
+
 def test_fetch_redacts_key_from_transport_errors(monkeypatch, api_key):
     """A leaked key in a stack trace is the realistic exposure path."""
 

@@ -58,6 +58,11 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+# Every distinct stop sequence seen, numbered in order of first sight. It grows
+# only when the timetable gains a new stop sequence; one day's cache has 14.
+_PATTERN_IDS: dict[tuple[str, ...], int] = {}
+
+
 @dataclass
 class Trip:
     trip_id: str
@@ -76,6 +81,27 @@ class Trip:
         if cached is None:
             cached = {s[1]: i for i, s in enumerate(self.stops)}
             object.__setattr__(self, "_index_of", cached)
+        return cached
+
+    @property
+    def pattern(self) -> int:
+        """An id for the stop ids in calling order, the same for every trip sharing them.
+
+        This is what the distance to a vehicle depends on, since a stop id has
+        a single position. Arrival times do not enter into it, which is why
+        `stops` itself cannot serve as the key: the 992 trips cached for one
+        Thursday carry 496 distinct stop lists but only 14 patterns, so trips
+        on one route almost always share an answer.
+
+        It is an interned integer rather than the tuple itself because `match`
+        looks it up tens of thousands of times a poll, and Python does not
+        cache a tuple's hash: each lookup would rehash all ~49 stop ids.
+        """
+        cached = getattr(self, "_pattern", None)
+        if cached is None:
+            stop_ids = tuple(s[1] for s in self.stops)
+            cached = _PATTERN_IDS.setdefault(stop_ids, len(_PATTERN_IDS))
+            object.__setattr__(self, "_pattern", cached)
         return cached
 
     @property
@@ -312,23 +338,37 @@ def match(vehicle: Vehicle, candidates: list[Trip]) -> Match | None:
     # the same trip is asked the same question several times over: once by the
     # direction filter, once for each tier's tie-break, once more for the
     # winner's off-route bound. That came to 857 walks and 40,824 iterations to
-    # arrive at those 191 distances. The answer depends only on the trip and a
-    # position that does not change within a call, so it is worth remembering.
-    near_memo: dict[str, tuple[int, float]] = {}
+    # arrive at those 191 distances. The answer depends only on the trip's stop
+    # pattern and a position that does not change within a call, so it is worth
+    # remembering. Keying on the pattern rather than the trip matters on the real
+    # cache: a 192 is checked against hundreds of trips that share a handful of
+    # patterns, and keyed per trip that came to 8,173 walks for 68 vehicles.
+    near_memo: dict[int, tuple[int, float]] = {}
 
     def nearest(trip: Trip) -> tuple[int, float]:
-        hit = near_memo.get(trip.trip_id)
+        key = trip.pattern
+        hit = near_memo.get(key)
         if hit is None:
-            hit = near_memo[trip.trip_id] = _nearest(trip, vehicle.lat, vehicle.lon, seen)
+            hit = near_memo[key] = _nearest(trip, vehicle.lat, vehicle.lon, seen)
         return hit
 
     if vehicle.dest_ref:
         serving = [t for t in pool if vehicle.dest_ref in t.index_of]
         if not serving:
             return None
-        heading_there = [
-            t for t in serving if _dest_is_downstream(t, vehicle.dest_ref, nearest(t)[0])
-        ]
+        # The direction test reads only the stop sequence, so it is settled once
+        # per pattern, like `nearest`.
+        downstream: dict[int, bool] = {}
+
+        def heads_there(t: Trip) -> bool:
+            hit = downstream.get(t.pattern)
+            if hit is None:
+                hit = downstream[t.pattern] = _dest_is_downstream(
+                    t, vehicle.dest_ref, nearest(t)[0]
+                )
+            return hit
+
+        heading_there = [t for t in serving if heads_there(t)]
         if not heading_there:
             # Going somewhere this timetable does not reach from here: another
             # direction, or a variant that is not cached. Omitting it is right;

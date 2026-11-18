@@ -219,6 +219,73 @@ class TestPipeline:
         assert STOP_ABSENT_2 in atcos
 
 
+class TestHistorySummaryCache:
+    def test_counts_are_retaken_only_when_stale(self, live_app, monkeypatch):
+        """Counting the history tables is a full scan, so a poll reuses the last count."""
+        calls = []
+        real = history.stats_summary
+
+        def counting(conn):
+            calls.append(1)
+            return real(conn)
+
+        monkeypatch.setattr(history, "stats_summary", counting)
+        live_app["payload"] = siri_document([])
+
+        first = web.poll_once()
+        web.poll_once()
+        assert len(calls) == 1
+        assert first["history"] == web.state.history
+        assert set(first["history"]) == {
+            "observations",
+            "history_days",
+            "stop_events",
+            "learned_segments",
+        }
+
+        assert web.state.history_at is not None
+        web.state.history_at -= web.HISTORY_SUMMARY_SECS
+        web.poll_once()
+        assert len(calls) == 2
+
+
+class TestSegmentsReload:
+    def _count_loads(self, monkeypatch) -> list:
+        calls: list = []
+        real = history.load_segment_stats
+
+        def counting(conn):
+            calls.append(1)
+            return real(conn)
+
+        monkeypatch.setattr(history, "load_segment_stats", counting)
+        return calls
+
+    def test_an_unstamped_database_reloads_every_poll(self, live_app, monkeypatch):
+        calls = self._count_loads(monkeypatch)
+        live_app["payload"] = siri_document([])
+        web.poll_once()
+        web.poll_once()
+        assert len(calls) == 2
+
+    def test_reloads_only_when_a_relearn_moves_the_stamp(self, live_app, monkeypatch):
+        conn = db.connect()
+        history.learn_segments(conn)
+        conn.close()
+        calls = self._count_loads(monkeypatch)
+        live_app["payload"] = siri_document([])
+
+        web.poll_once()
+        web.poll_once()
+        assert len(calls) == 1, "an unchanged model was reloaded"
+
+        conn = db.connect()
+        history.learn_segments(conn)
+        conn.close()
+        web.poll_once()
+        assert len(calls) == 2, "the relearned model was not picked up"
+
+
 class TestTripServingTwoWatchedStops:
     """One trip, two watched stops — real since MANGTMGT joined the list.
 

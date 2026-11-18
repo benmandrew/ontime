@@ -325,6 +325,19 @@ class TestLearnSegments:
         assert first == second
 
 
+class TestSegmentsStamp:
+    def test_absent_until_the_first_relearn(self, built_db):
+        assert history.segments_stamp(built_db) is None
+
+    def test_every_relearn_moves_it(self, built_db):
+        history.learn_segments(built_db)
+        first = history.segments_stamp(built_db)
+        history.learn_segments(built_db)
+        second = history.segments_stamp(built_db)
+        assert first is not None
+        assert second != first
+
+
 class TestStatsSummary:
     def test_reports_zero_on_an_empty_database(self, built_db):
         s = history.stats_summary(built_db)

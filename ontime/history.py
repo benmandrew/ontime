@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sqlite3
 import statistics
+import time
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
@@ -30,6 +31,9 @@ STOP_RADIUS_M = 120.0
 
 # Segments need at least this many observations before the learned time is used.
 MIN_SAMPLES = 5
+
+# The `meta` key `learn_segments` stamps each time it rewrites `segment_stats`.
+SEGMENTS_STAMP_KEY = "segments_learned_at"
 
 # How far back `derive_stop_events` scans raw positions. Wider than the hourly
 # cadence it runs at, so a skipped pass loses nothing.
@@ -305,8 +309,22 @@ def learn_segments(conn: sqlite3.Connection) -> int:
             )
         )
     conn.executemany("INSERT OR REPLACE INTO segment_stats VALUES (?,?,?,?,?,?,?,?)", rows)
+    # In the same transaction as the rows, so a reader that sees the new stamp
+    # also sees the new model. `web.refresh_segments` reloads on a change.
+    conn.execute(
+        "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+        (SEGMENTS_STAMP_KEY, str(time.time_ns())),
+    )
     conn.commit()
     return len(rows)
+
+
+def segments_stamp(conn: sqlite3.Connection) -> str | None:
+    """When `learn_segments` last rewrote `segment_stats`, or None if it never has."""
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (SEGMENTS_STAMP_KEY,)
+    ).fetchone()
+    return row["value"] if row else None
 
 
 def load_segment_stats(conn: sqlite3.Connection) -> dict[tuple, tuple[float, float, int]]:

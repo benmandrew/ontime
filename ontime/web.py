@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import json
 import re
+import time
 from collections.abc import AsyncGenerator
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -49,6 +50,7 @@ class State:
         self.trips_built: str | None = None
         self.warned_empty_for: date | None = None
         self.segments: dict = {}
+        self.segments_stamp: str | None = None
         self.board: dict = {"stops": [], "updated": None, "error": None}
         self.vehicles: list = []
         self.last_poll: float | None = None
@@ -56,6 +58,9 @@ class State:
         self.stop_points: dict[str, tuple[float, float]] = {}
         # The map's route lines, rebuilt with the timetable rather than per poll.
         self.map_routes: list[dict] | None = None
+        # `history.stats_summary`, and the monotonic time it was taken.
+        self.history: dict = {}
+        self.history_at: float | None = None
 
 
 state = State()
@@ -189,15 +194,42 @@ def refresh_stop_points(conn) -> None:
 
 
 def refresh_segments(conn) -> None:
-    """Reload learned segment times on every poll.
+    """Reload learned segment times when the maintenance container relearns them.
 
-    These are rewritten by the maintenance container roughly hourly, and this
-    process has no way of being told. Tying the reload to the timetable date
-    instead would leave the dashboard using yesterday's model all day. The
-    query returns a few thousand rows at most, so re-reading it every cycle
-    costs less than tracking staleness would.
+    They are rewritten roughly hourly by another process, so the reload keys on
+    the stamp `learn_segments` writes in the same transaction, the way
+    `refresh_timetable` keys on `built_at`. Tying it to the date instead would
+    leave the dashboard on yesterday's model all day. Reloading on every poll
+    was correct too, but it read 10,665 rows every 15 seconds on fisk, about
+    0.05 CPU-seconds, to rebuild a dict that changes once an hour.
+
+    A database no relearn has stamped yet still reloads on every poll, which
+    is what this did before the stamp existed. That covers a volume from before
+    this change until its first relearn, and a cold start where there is
+    nothing to learn yet.
     """
+    stamp = history.segments_stamp(conn)
+    if stamp is not None and stamp == state.segments_stamp:
+        return
     state.segments = history.load_segment_stats(conn)
+    state.segments_stamp = stamp
+
+
+# How long the board may show history counts before they are taken again.
+# `stats_summary` counts every row of `observations` and `stop_events`, which on
+# fisk's 776MB database cost 0.84 CPU-seconds and up to 2.9s of disk reads, so
+# running it every 15 seconds was three quarters of what the poller did. The
+# counts grow by a few thousand rows a day, so five minutes is still accurate.
+HISTORY_SUMMARY_SECS = 300.0
+
+
+def refresh_history(conn) -> None:
+    """Retake the history counts when they are older than `HISTORY_SUMMARY_SECS`."""
+    now = time.monotonic()
+    if state.history_at is not None and now - state.history_at < HISTORY_SUMMARY_SECS:
+        return
+    state.history = history.stats_summary(conn)
+    state.history_at = now
 
 
 def build_board(conn) -> dict:
@@ -300,7 +332,7 @@ def build_board(conn) -> dict:
             "trips": len(state.trips),
             "routes": sorted(state.routes),
         },
-        "history": history.stats_summary(conn),
+        "history": state.history,
         "error": None,
     }
 
@@ -320,6 +352,7 @@ def poll_once() -> dict:
         refresh_timetable(conn)
         refresh_stop_points(conn)
         refresh_segments(conn)
+        refresh_history(conn)
         return build_board(conn)
     finally:
         conn.close()
